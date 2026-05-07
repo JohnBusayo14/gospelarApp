@@ -4,6 +4,7 @@ const crypto  = require('crypto');
 const cors    = require('cors');
 const axios   = require('axios');
 const db      = require('./db');
+const { sendApprovalEmail, sendRejectionEmail } = require('./services/mailer');
 require('dotenv').config();
 
 const app = express();
@@ -298,6 +299,24 @@ const initDb = async () => {
       verses JSONB  NOT NULL DEFAULT '[]'::jsonb
     )`,
 
+    // ── Churches — top-level org unit. Each teacher belongs to one church,
+    //    each church has one admin. Insight endpoints filter by church_id so
+    //    Church A's admin only ever sees Church A's data.
+    `CREATE TABLE IF NOT EXISTS churches (
+      id           SERIAL       PRIMARY KEY,
+      name         VARCHAR(200) NOT NULL,
+      location     VARCHAR(200),
+      admin_email  VARCHAR(255) NOT NULL,
+      admin_token  VARCHAR(80)  NOT NULL,            -- per-church secret used as x-church-key
+      invite_code  VARCHAR(20)  UNIQUE NOT NULL,     -- 6-8 char code teachers paste at signup
+      created_at   TIMESTAMPTZ  DEFAULT NOW()
+    )`,
+
+    // Link teachers to their church via the users table (every teacher already
+    // has a row in `users`). Nullable for back-compat with existing teachers
+    // created before this change — they can be assigned later from admin.
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS church_id INT REFERENCES churches(id) ON DELETE SET NULL`,
+
     // ── Teacher / class system ───────────────────────────────────────────────
     `CREATE TABLE IF NOT EXISTS classes (
       id                  SERIAL       PRIMARY KEY,
@@ -307,8 +326,11 @@ const initDb = async () => {
       category            VARCHAR(50)  DEFAULT 'adult',
       subscribed_category VARCHAR(20)  DEFAULT 'adult',
       invite_code         VARCHAR(20)  UNIQUE,
+      church_id           INT          REFERENCES churches(id) ON DELETE SET NULL,
       created_at          TIMESTAMPTZ  DEFAULT NOW()
     )`,
+    // Back-compat: add church_id to existing classes table if it's missing.
+    `ALTER TABLE classes ADD COLUMN IF NOT EXISTS church_id INT REFERENCES churches(id) ON DELETE SET NULL`,
 
     `CREATE TABLE IF NOT EXISTS class_members (
       id            SERIAL       PRIMARY KEY,
@@ -340,6 +362,14 @@ const initDb = async () => {
       awarded_by    VARCHAR(255),
       awarded_at    TIMESTAMPTZ  DEFAULT NOW()
     )`,
+
+    // church_id back-fill on attendance + teacher_marks so we can filter
+    // insight queries by church in O(1) instead of joining through classes.
+    `ALTER TABLE attendance    ADD COLUMN IF NOT EXISTS church_id INT REFERENCES churches(id) ON DELETE SET NULL`,
+    `ALTER TABLE teacher_marks ADD COLUMN IF NOT EXISTS church_id INT REFERENCES churches(id) ON DELETE SET NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_attendance_church    ON attendance(church_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_teacher_marks_church ON teacher_marks(church_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_classes_church       ON classes(church_id)`,
 
     // ── Trigger: auto-update updated_at ──────────────────────────────────────
     `CREATE OR REPLACE FUNCTION update_updated_at()
@@ -393,6 +423,25 @@ const initDb = async () => {
      END $$`,
 
     `ALTER TABLE units DROP COLUMN IF EXISTS category`,
+
+    // ── Church admin self-service signup + main-admin approval flow ──────────
+    // Existing churches keep approval_status='approved' (default), so the
+    // manual /api/admin/churches creation flow is unaffected.
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS password_hash      TEXT`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS contact_name       VARCHAR(150)`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS phone              VARCHAR(50)`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS approval_status    VARCHAR(20) DEFAULT 'approved'`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS approved_at        TIMESTAMPTZ`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS rejected_reason    TEXT`,
+    `ALTER TABLE churches ADD COLUMN IF NOT EXISTS rejected_at        TIMESTAMPTZ`,
+    // Make email unique so signup can detect duplicates cleanly.
+    `DO $$ BEGIN
+       IF NOT EXISTS (
+         SELECT 1 FROM pg_constraint WHERE conname = 'churches_admin_email_key'
+       ) THEN
+         ALTER TABLE churches ADD CONSTRAINT churches_admin_email_key UNIQUE (admin_email);
+       END IF;
+     END $$`,
   ];
 
   for (const sql of steps) {
@@ -445,12 +494,365 @@ const adminAuth = (req, res, next) => {
   next();
 };
 
+// Per-church admin auth — used by the church admin dashboard. Reads the
+// `x-church-key` header, looks up which church it belongs to, and attaches
+// `req.church = { id, name, ... }` to the request. Master ADMIN_SECRET also
+// works (treated as super-admin with no church scope; req.church = null).
+const churchAuth = async (req, res, next) => {
+  const masterKey = req.headers['x-admin-key'];
+  if (masterKey && masterKey === process.env.ADMIN_SECRET) {
+    req.church = null;   // super-admin — no church filter
+    return next();
+  }
+  const churchKey = req.headers['x-church-key'];
+  if (!churchKey) return res.status(401).json({ error: 'Missing x-church-key (or x-admin-key for super-admin).' });
+  try {
+    const r = await db.query(
+      'SELECT id, name, location, admin_email, invite_code, approval_status FROM churches WHERE admin_token = $1',
+      [churchKey]
+    );
+    if (!r.rows.length) return res.status(403).json({ error: 'Invalid church token.' });
+    // Pending or rejected churches have a token but cannot use it until the
+    // main admin approves them.
+    if (r.rows[0].approval_status !== 'approved') {
+      return res.status(403).json({
+        error: 'church_not_approved',
+        status: r.rows[0].approval_status,
+        message: 'This church account is not approved yet. Wait for the main admin to authorize it.',
+      });
+    }
+    req.church = r.rows[0];
+    next();
+  } catch (e) {
+    console.error('churchAuth:', e.message);
+    res.status(500).json({ error: 'Auth check failed.' });
+  }
+};
+
+// Helper for church-scoped queries: returns "AND church_id = $X" + the param,
+// or "" + no param if super-admin. Keeps endpoint code clean.
+const churchScope = (req, paramIndex) => {
+  if (!req.church) return { sql: '', params: [] };
+  return { sql: ` AND church_id = $${paramIndex}`, params: [req.church.id] };
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HEALTH
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) =>
   res.json({ status:'ok', timestamp:new Date().toISOString() })
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHURCHES — top-level org. Super-admin creates them; each church gets its
+// own admin_token (used as x-church-key) and invite_code (used by teachers).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Generate URL-safe random tokens for new churches.
+const randCode = (len = 8) => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no 0/O/I/1 to avoid confusion
+  let out = '';
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+};
+const randToken = () => Array.from({length: 4}, () => randCode(8)).join('-');
+
+// Super-admin creates a church. Body: { name, location, admin_email }
+// Returns the new admin_token + invite_code — show these to the church admin
+// once at creation time (they paste admin_token into the dashboard, give the
+// invite_code to their teachers).
+app.post('/api/admin/churches', adminAuth, async (req, res) => {
+  const { name, location, admin_email } = req.body || {};
+  if (!name || !admin_email) return res.status(400).json({ error: 'name and admin_email required.' });
+  if (!isValidEmail(admin_email))         return res.status(400).json({ error: 'Invalid admin_email.' });
+  try {
+    // Loop until we hit a unique invite_code (collisions extremely rare with 8 chars).
+    let inviteCode, attempts = 0;
+    while (attempts++ < 10) {
+      inviteCode = randCode(8);
+      const dup = await db.query('SELECT 1 FROM churches WHERE invite_code = $1', [inviteCode]);
+      if (!dup.rows.length) break;
+    }
+    const adminToken = randToken();
+    const r = await db.query(`
+      INSERT INTO churches (name, location, admin_email, admin_token, invite_code)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, name, location, admin_email, invite_code, admin_token, created_at
+    `, [name.trim(), (location || '').trim() || null, admin_email.toLowerCase(), adminToken, inviteCode]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    console.error('POST /api/admin/churches:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to create church.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHURCH ADMIN SELF-SERVICE SIGNUP / LOGIN
+// ─────────────────────────────────────────────────────────────────────────────
+// Anyone can sign up as a church admin via church-admin.html. The new church
+// row starts with approval_status='pending' and cannot use its admin_token to
+// hit any /api/admin/insights/* endpoint until the master admin approves it.
+//
+// Login then exchanges email+password for the admin_token, but only if the
+// church is approved.
+
+// POST /api/church-admin/signup  (public)
+// Body: { church_name, location, contact_name, admin_email, phone, password }
+app.post('/api/church-admin/signup', async (req, res) => {
+  const {
+    church_name, location, contact_name,
+    admin_email, phone, password,
+  } = req.body || {};
+
+  if (!church_name || !admin_email || !password)
+    return res.status(400).json({ error: 'church_name, admin_email and password are required.' });
+  if (!isValidEmail(admin_email))
+    return res.status(400).json({ error: 'Invalid admin_email.' });
+  if (String(password).length < 6)
+    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+
+  try {
+    // Reject duplicate email.
+    const dup = await db.query(
+      'SELECT id, approval_status FROM churches WHERE admin_email = $1',
+      [admin_email.toLowerCase()]
+    );
+    if (dup.rows.length) {
+      const status = dup.rows[0].approval_status;
+      const msg = status === 'pending'  ? 'An application with this email is already pending review.'
+                : status === 'rejected' ? 'An earlier application with this email was rejected. Contact the main admin.'
+                                        : 'An account with this email already exists. Sign in instead.';
+      return res.status(409).json({ error: msg, status });
+    }
+
+    // Reserve a unique invite_code now so we don't fight uniqueness later.
+    let inviteCode, attempts = 0;
+    while (attempts++ < 10) {
+      inviteCode = randCode(8);
+      const dupCode = await db.query('SELECT 1 FROM churches WHERE invite_code = $1', [inviteCode]);
+      if (!dupCode.rows.length) break;
+    }
+    const adminToken = randToken();
+    const hash = await bcrypt.hash(password, 12);
+
+    const r = await db.query(`
+      INSERT INTO churches (
+        name, location, admin_email, admin_token, invite_code,
+        password_hash, contact_name, phone, approval_status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+      RETURNING id, name, admin_email, approval_status, created_at
+    `, [
+      church_name.trim(),
+      (location     || '').trim() || null,
+      admin_email.toLowerCase(),
+      adminToken,
+      inviteCode,
+      hash,
+      (contact_name || '').trim() || null,
+      (phone        || '').trim() || null,
+    ]);
+
+    res.status(201).json({
+      message: 'Application submitted. The main admin will review your church and approve access shortly.',
+      church: r.rows[0],
+    });
+  } catch (e) {
+    console.error('POST /api/church-admin/signup:', e.code, e.message);
+    res.status(500).json({ error: 'Signup failed.' });
+  }
+});
+
+// POST /api/church-admin/login  (public)
+// Body: { email, password }
+// On approved → { admin_token, church }. Pending/rejected → 403 with status.
+app.post('/api/church-admin/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password)
+    return res.status(400).json({ error: 'Email and password are required.' });
+
+  try {
+    const r = await db.query(`
+      SELECT id, name, location, admin_email, admin_token, invite_code,
+             password_hash, approval_status, rejected_reason
+        FROM churches
+       WHERE admin_email = $1
+    `, [String(email).toLowerCase()]);
+    if (!r.rows.length)
+      return res.status(401).json({ error: 'No church admin account with this email.' });
+
+    const row = r.rows[0];
+    if (!row.password_hash) {
+      // This is a manually-created church (pre-self-service). They never set a
+      // password; fall back to the legacy admin_token-only flow.
+      return res.status(403).json({
+        error: 'no_password',
+        message: 'This church was created by the main admin and does not use a password. Use the admin token they gave you (paste it on the church-admin page header).',
+      });
+    }
+
+    const match = await bcrypt.compare(password, row.password_hash);
+    if (!match) return res.status(401).json({ error: 'Incorrect password.' });
+
+    if (row.approval_status === 'pending') {
+      return res.status(403).json({
+        error: 'pending',
+        message: 'Your application is still under review. You will be able to sign in once the main admin approves it.',
+      });
+    }
+    if (row.approval_status === 'rejected') {
+      return res.status(403).json({
+        error: 'rejected',
+        message: row.rejected_reason
+          ? `Application rejected: ${row.rejected_reason}`
+          : 'Application rejected. Contact the main admin.',
+      });
+    }
+
+    res.json({
+      message: 'Signed in.',
+      admin_token: row.admin_token,
+      church: {
+        id:           row.id,
+        name:         row.name,
+        location:     row.location,
+        admin_email:  row.admin_email,
+        invite_code:  row.invite_code,
+      },
+    });
+  } catch (e) {
+    console.error('POST /api/church-admin/login:', e.code, e.message);
+    res.status(500).json({ error: 'Login failed.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN ADMIN — REVIEW + APPROVE / REJECT CHURCH APPLICATIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/admin/church-applications?status=pending   (default: pending)
+// Returns the list of churches with the requested approval_status.
+app.get('/api/admin/church-applications', adminAuth, async (req, res) => {
+  const status = String(req.query.status || 'pending').toLowerCase();
+  if (!['pending', 'approved', 'rejected', 'all'].includes(status))
+    return res.status(400).json({ error: 'status must be pending|approved|rejected|all.' });
+  try {
+    const where  = status === 'all' ? '' : 'WHERE approval_status = $1';
+    const params = status === 'all' ? [] : [status];
+    const r = await db.query(`
+      SELECT id, name, location, admin_email, contact_name, phone,
+             invite_code, approval_status, approved_at, rejected_reason,
+             rejected_at, created_at
+        FROM churches
+        ${where}
+       ORDER BY created_at DESC
+    `, params);
+    res.json({ status, count: r.rows.length, applications: r.rows });
+  } catch (e) {
+    console.error('GET /api/admin/church-applications:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load applications.' });
+  }
+});
+
+// POST /api/admin/church-applications/:id/approve
+app.post('/api/admin/church-applications/:id/approve', adminAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const r = await db.query(`
+      UPDATE churches
+         SET approval_status = 'approved',
+             approved_at     = NOW(),
+             rejected_reason = NULL,
+             rejected_at     = NULL
+       WHERE id = $1
+       RETURNING id, name, admin_email, contact_name, invite_code, admin_token, approval_status, approved_at
+    `, [id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Application not found.' });
+    const church = r.rows[0];
+
+    // Best-effort email — never blocks or rolls back the approval.
+    sendApprovalEmail(church, process.env.CHURCH_ADMIN_URL || null)
+      .then((m) => { if (!m.ok) console.warn('[approve] email skipped:', m.error); })
+      .catch((e) => console.warn('[approve] email error:', e.message));
+
+    res.json({ message: 'Approved.', church });
+  } catch (e) {
+    console.error('POST /api/admin/church-applications/:id/approve:', e.code, e.message);
+    res.status(500).json({ error: 'Approve failed.' });
+  }
+});
+
+// POST /api/admin/church-applications/:id/reject  body: { reason }
+app.post('/api/admin/church-applications/:id/reject', adminAuth, async (req, res) => {
+  const id     = parseInt(req.params.id, 10);
+  const reason = (req.body?.reason || '').trim() || null;
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const r = await db.query(`
+      UPDATE churches
+         SET approval_status = 'rejected',
+             rejected_reason = $2,
+             rejected_at     = NOW(),
+             approved_at     = NULL
+       WHERE id = $1
+       RETURNING id, name, admin_email, contact_name, approval_status, rejected_reason, rejected_at
+    `, [id, reason]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Application not found.' });
+    const church = r.rows[0];
+
+    sendRejectionEmail(church, reason)
+      .then((m) => { if (!m.ok) console.warn('[reject] email skipped:', m.error); })
+      .catch((e) => console.warn('[reject] email error:', e.message));
+
+    res.json({ message: 'Rejected.', church });
+  } catch (e) {
+    console.error('POST /api/admin/church-applications/:id/reject:', e.code, e.message);
+    res.status(500).json({ error: 'Reject failed.' });
+  }
+});
+
+// Super-admin lists all churches (with member counts).
+// admin_token is omitted by default; pass ?include=token to get it back.
+// Even though this route is already adminAuth-gated, double-gating the token
+// behind an explicit opt-in reduces accidental exposure (e.g. screenshots of
+// the table that include the token column).
+app.get('/api/admin/churches', adminAuth, async (req, res) => {
+  const includeToken = req.query.include === 'token';
+  try {
+    const r = await db.query(`
+      SELECT c.id, c.name, c.location, c.admin_email, c.invite_code, c.created_at${includeToken ? ', c.admin_token' : ''},
+             (SELECT COUNT(*) FROM users    WHERE church_id = c.id AND role = 'teacher') AS teachers,
+             (SELECT COUNT(*) FROM classes  WHERE church_id = c.id)                       AS classes
+        FROM churches c
+       ORDER BY c.created_at DESC
+    `);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Church admin reads their own church info (for the dashboard banner).
+// Identifies via x-church-key.
+app.get('/api/church/me', churchAuth, (req, res) => {
+  if (!req.church) return res.status(400).json({ error: 'super-admin call — no church scope' });
+  // Don't echo the admin_token back — it's already known to the caller and
+  // logging it in network responses is needless exposure.
+  const { admin_token, ...safe } = req.church;
+  res.json(safe);
+});
+
+// Public lookup so teachers can validate a church code on the registration
+// screen BEFORE submitting the form. Returns just the church name.
+app.get('/api/church/by-code/:code', async (req, res) => {
+  try {
+    const r = await db.query(
+      'SELECT id, name, location FROM churches WHERE invite_code = $1',
+      [req.params.code.toUpperCase()]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Unknown church code.' });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CATEGORIES
@@ -559,7 +961,7 @@ app.post('/api/admin/translations/seed', adminAuth, async (req, res) => {
     'status','expires_on','days_remaining','active','expired','renew','extend','your_plan',
     // ── Auto-injected app-wide UI keys ──
     'about_app_info','about_backend','about_built_with','about_contact','about_copyright','about_dept',
-    'about_email','about_mission_body','about_our_mission','about_released','about_tagline','about_version',
+    'about_email','about_mission_body','about_our_mission','about_our_vision','about_vision_body','about_released','about_tagline','about_version',
     'about_website','account_active_n_days','account_active_one_day','account_all_age_groups','account_all_categories','account_badge_500_plan',
     'account_badge_all_access','account_category','account_email','account_extend_sub','account_full_access_note','account_n_days',
     'account_one_day','account_renew_sub','account_signout_device','account_signout_msg','account_signout_note','account_single',
@@ -687,7 +1089,9 @@ app.post('/api/admin/translations/seed', adminAuth, async (req, res) => {
     about_dept: 'Sunday School Department',
     about_email: 'EMAIL',
     about_mission_body: 'GOFAMINT Sunday School is dedicated to providing quality, biblically-sound lessons that equip members of all ages for Christian living. Our app brings the Sunday School experience to your fingertips — anytime, anywhere.',
-    about_our_mission: 'OUR MISSION',
+    about_our_mission: 'Our Mission',
+    about_our_vision:  'Our Vision',
+    about_vision_body: 'To raise a generation of believers grounded in scripture, equipped to live out their faith with confidence and conviction — and to make the depth of Sunday School teaching accessible to every member of our church family, in every language they speak, on every device they own.',
     about_released: 'RELEASED',
     about_tagline: 'Empowering believers through systematic Bible study and spiritual formation.',
     about_version: 'VERSION',
@@ -1630,18 +2034,22 @@ const insightsWindow = (req) => {
 //    student attendance record, since teachers only mark students who showed
 //    up). Returns daily + weekly counts for the lookback window plus per-class
 //    totals so leaders can spot which classes have flat or declining attendance.
-app.get('/api/admin/insights/attendance', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/attendance', churchAuth, async (req, res) => {
   const days = insightsWindow(req);
+  // Inject "AND church_id = $2" only when scoped to a church; otherwise
+  // (super-admin) the filter is empty and the query covers every church.
+  const tmScope = churchScope(req, 2);   // for teacher_marks queries
+  const cScope  = churchScope(req, 2);   // for classes JOIN — same param index
   try {
     const [daily, byClass, summary] = await Promise.all([
       db.query(`
         SELECT date_trunc('day', awarded_at)::date AS day,
                COUNT(DISTINCT (class_id, lesson_number, student_email)) AS attended
           FROM teacher_marks
-         WHERE awarded_at >= NOW() - ($1 || ' days')::interval
+         WHERE awarded_at >= NOW() - ($1 || ' days')::interval${tmScope.sql}
          GROUP BY day
          ORDER BY day ASC
-      `, [String(days)]),
+      `, [String(days), ...tmScope.params]),
       db.query(`
         SELECT c.id, c.name, c.category, c.invite_code,
                COUNT(DISTINCT (tm.lesson_number, tm.student_email)) AS attendance_count,
@@ -1650,18 +2058,19 @@ app.get('/api/admin/insights/attendance', adminAuth, async (req, res) => {
           LEFT JOIN teacher_marks tm
             ON tm.class_id = c.id
            AND tm.awarded_at >= NOW() - ($1 || ' days')::interval
+         WHERE 1=1${cScope.sql ? cScope.sql.replace('AND church_id', 'AND c.church_id') : ''}
          GROUP BY c.id
          ORDER BY attendance_count DESC NULLS LAST
          LIMIT 20
-      `, [String(days)]),
+      `, [String(days), ...cScope.params]),
       db.query(`
         SELECT
           COUNT(DISTINCT (class_id, lesson_number, student_email)) AS total_attendances,
           COUNT(DISTINCT student_email)                            AS unique_students,
           COUNT(DISTINCT class_id)                                 AS active_classes
         FROM teacher_marks
-        WHERE awarded_at >= NOW() - ($1 || ' days')::interval
-      `, [String(days)]),
+        WHERE awarded_at >= NOW() - ($1 || ' days')::interval${tmScope.sql}
+      `, [String(days), ...tmScope.params]),
     ]);
     res.json({
       windowDays: days,
@@ -1678,9 +2087,71 @@ app.get('/api/admin/insights/attendance', adminAuth, async (req, res) => {
 // 2. Engagement stats — totals + active-subscriber count + lesson completions
 //    over time + signups over time. Gives leaders a single screen of "is the
 //    app actually being used?" answers.
-app.get('/api/admin/insights/engagement', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/engagement', churchAuth, async (req, res) => {
   const days = insightsWindow(req);
+  // church-scoped vs super-admin queries diverge enough that we branch.
+  // For a church admin, "engagement" means activity tied to THEIR teachers'
+  // classes — quiz completions by their enrolled students, marks awarded by
+  // their teachers, etc. Subscribers aren't church-scoped in the schema, so
+  // a church admin sees nothing for that metric (set to 0 to keep UI sane).
   try {
+    if (req.church) {
+      const cid = req.church.id;
+      const [totals, completionsDaily, marksDaily, classes] = await Promise.all([
+        db.query(`
+          SELECT
+            (SELECT COUNT(*) FROM users    WHERE church_id = $1 AND role = 'teacher') AS total_teachers,
+            (SELECT COUNT(DISTINCT cm.student_email)
+               FROM class_members cm JOIN classes c ON c.id = cm.class_id
+              WHERE c.church_id = $1)                                                 AS enrolled_students,
+            (SELECT COUNT(*)
+               FROM user_scores us
+               JOIN class_members cm ON cm.student_email = us.email
+               JOIN classes c        ON c.id = cm.class_id
+              WHERE c.church_id = $1)                                                 AS total_quiz_completions,
+            (SELECT COUNT(DISTINCT us.email)
+               FROM user_scores us
+               JOIN class_members cm ON cm.student_email = us.email
+               JOIN classes c        ON c.id = cm.class_id
+              WHERE c.church_id = $1
+                AND us.completed_at >= NOW() - ($2 || ' days')::interval)             AS active_learners,
+            (SELECT COALESCE(SUM(points), 0) FROM teacher_marks WHERE church_id = $1) AS total_points_awarded
+        `, [cid, String(days)]),
+        db.query(`
+          SELECT date_trunc('day', us.completed_at)::date AS day, COUNT(*) AS completions
+            FROM user_scores us
+            JOIN class_members cm ON cm.student_email = us.email
+            JOIN classes c        ON c.id = cm.class_id
+           WHERE c.church_id = $1
+             AND us.completed_at >= NOW() - ($2 || ' days')::interval
+           GROUP BY day
+           ORDER BY day ASC
+        `, [cid, String(days)]),
+        db.query(`
+          SELECT date_trunc('day', awarded_at)::date AS day, COUNT(*) AS signups
+            FROM teacher_marks
+           WHERE church_id = $1
+             AND awarded_at >= NOW() - ($2 || ' days')::interval
+           GROUP BY day
+           ORDER BY day ASC
+        `, [cid, String(days)]),
+        db.query(`
+          SELECT category, COUNT(*) AS active, COUNT(*) AS total
+            FROM classes WHERE church_id = $1
+           GROUP BY category
+           ORDER BY active DESC
+        `, [cid]),
+      ]);
+      return res.json({
+        windowDays:        days,
+        totals:            totals.rows[0],
+        completionsDaily:  completionsDaily.rows,
+        signupsDaily:      marksDaily.rows,    // re-purposed: marks-awarded daily for church view
+        subsByCategory:    classes.rows,        // re-purposed: classes-by-category for church view
+      });
+    }
+
+    // ── Super-admin (no church scope) — original global metrics ────────
     const [totals, completionsDaily, signupsDaily, subsByCategory] = await Promise.all([
       db.query(`
         SELECT
@@ -1732,9 +2203,30 @@ app.get('/api/admin/insights/engagement', adminAuth, async (req, res) => {
 // 3. Most completed lessons — top 25 by completion count, with title + average
 //    score. Helps leaders see which lessons are landing and which are being
 //    skipped.
-app.get('/api/admin/insights/most-completed-lessons', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/most-completed-lessons', churchAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 25, 100);
+  // Church-scoped path: only count quiz completions by students who are in
+  // a class belonging to this church. Super-admin path: all completions.
   try {
+    if (req.church) {
+      const r = await db.query(`
+        SELECT l.id, l.lesson_number, l.title, l.category_id, l.lesson_date,
+               COUNT(us.id)                                              AS completions,
+               COUNT(DISTINCT us.email)                                  AS unique_learners,
+               ROUND(AVG(us.score)::numeric, 1)                          AS avg_score,
+               ROUND(AVG(NULLIF(us.max_score, 0))::numeric, 1)           AS avg_max_score,
+               MAX(us.completed_at)                                      AS last_completed
+          FROM lessons l
+          JOIN user_scores us    ON us.lesson_id = l.id
+          JOIN class_members cm  ON cm.student_email = us.email
+          JOIN classes c         ON c.id = cm.class_id
+         WHERE c.church_id = $2
+         GROUP BY l.id
+         ORDER BY completions DESC, unique_learners DESC
+         LIMIT $1
+      `, [limit, req.church.id]);
+      return res.json(r.rows);
+    }
     const r = await db.query(`
       SELECT l.id, l.lesson_number, l.title, l.category_id, l.lesson_date,
              COUNT(us.id)                                              AS completions,
@@ -1759,8 +2251,10 @@ app.get('/api/admin/insights/most-completed-lessons', adminAuth, async (req, res
 // 4. Teacher performance — per-teacher rollup. Counts classes owned, students
 //    enrolled, marks awarded, total points distributed, and last activity.
 //    Sorted by activity so dormant teachers float to the bottom.
-app.get('/api/admin/insights/teacher-performance', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/teacher-performance', churchAuth, async (req, res) => {
   const days = insightsWindow(req);
+  const cScope = churchScope(req, 2);    // applied to classes table via "c.church_id = $2"
+  const cClause = cScope.sql ? cScope.sql.replace('AND church_id', 'AND c.church_id') : '';
   try {
     const r = await db.query(`
       SELECT
@@ -1780,9 +2274,10 @@ app.get('/api/admin/insights/teacher-performance', adminAuth, async (req, res) =
       LEFT JOIN class_members cm ON cm.class_id = c.id
       LEFT JOIN teacher_marks  tm ON tm.class_id = c.id
       LEFT JOIN user_profiles  up ON up.email   = c.teacher_email
+      WHERE 1=1${cClause}
       GROUP BY c.teacher_email, up.display_name, up.avatar_emoji
       ORDER BY marks_awarded_recent DESC NULLS LAST, classes_owned DESC
-    `, [String(days)]);
+    `, [String(days), ...cScope.params]);
     res.json({ windowDays: days, teachers: r.rows });
   } catch (e) {
     console.error('insights/teacher-performance:', e.code || '(no code)', e.message);
@@ -1793,10 +2288,32 @@ app.get('/api/admin/insights/teacher-performance', adminAuth, async (req, res) =
 // 5. Top engaged learners — for the engagement detail panel.
 //    Different from /api/leaderboard: includes recency weighting (only counts
 //    activity in the window) and is admin-only.
-app.get('/api/admin/insights/top-learners', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/top-learners', churchAuth, async (req, res) => {
   const days  = insightsWindow(req);
   const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+  // Church-scoped: only learners enrolled in this church's classes count.
   try {
+    if (req.church) {
+      const r = await db.query(`
+        SELECT us.email,
+               COALESCE(up.display_name, split_part(us.email, '@', 1)) AS display_name,
+               COALESCE(up.avatar_emoji, '👤')                          AS avatar_emoji,
+               COALESCE(up.church, '')                                  AS church,
+               COUNT(DISTINCT us.lesson_id)                              AS lessons_completed,
+               COALESCE(SUM(us.score), 0)                                AS total_score,
+               MAX(us.completed_at)                                      AS last_active
+          FROM user_scores us
+          JOIN class_members cm ON cm.student_email = us.email
+          JOIN classes c        ON c.id = cm.class_id
+          LEFT JOIN user_profiles up ON up.email = us.email
+         WHERE us.completed_at >= NOW() - ($1 || ' days')::interval
+           AND c.church_id = $3
+         GROUP BY us.email, up.display_name, up.avatar_emoji, up.church
+         ORDER BY lessons_completed DESC, total_score DESC
+         LIMIT $2
+      `, [String(days), limit, req.church.id]);
+      return res.json({ windowDays: days, learners: r.rows });
+    }
     const r = await db.query(`
       SELECT us.email,
              COALESCE(up.display_name, split_part(us.email, '@', 1)) AS display_name,
@@ -1821,8 +2338,26 @@ app.get('/api/admin/insights/top-learners', adminAuth, async (req, res) => {
 
 // 6. Per-category lesson stats — average score, completion rate, hardest /
 //    easiest lesson per age group. Powers the lesson-detail panel.
-app.get('/api/admin/insights/lesson-categories', adminAuth, async (_req, res) => {
+app.get('/api/admin/insights/lesson-categories', churchAuth, async (req, res) => {
   try {
+    if (req.church) {
+      const r = await db.query(`
+        SELECT l.category_id                                                  AS category,
+               COUNT(DISTINCT l.id)                                           AS total_lessons,
+               COUNT(DISTINCT us.lesson_id)                                   AS lessons_attempted,
+               COUNT(us.id)                                                   AS total_completions,
+               COUNT(DISTINCT us.email)                                       AS unique_learners,
+               ROUND(AVG(us.score)::numeric, 1)                               AS avg_score
+          FROM lessons l
+          LEFT JOIN user_scores us ON us.lesson_id = l.id
+          LEFT JOIN class_members cm ON cm.student_email = us.email
+          LEFT JOIN classes c        ON c.id = cm.class_id AND c.church_id = $1
+         WHERE us.id IS NULL OR c.id IS NOT NULL
+         GROUP BY l.category_id
+         ORDER BY total_completions DESC NULLS LAST
+      `, [req.church.id]);
+      return res.json(r.rows);
+    }
     const r = await db.query(`
       SELECT l.category_id                                                  AS category,
              COUNT(DISTINCT l.id)                                           AS total_lessons,
@@ -1844,18 +2379,19 @@ app.get('/api/admin/insights/lesson-categories', adminAuth, async (_req, res) =>
 
 // 7. Mark-type distribution — how teachers are awarding marks
 //    (answered_question vs memory_verse vs bonus). Powers the teacher panel.
-app.get('/api/admin/insights/mark-distribution', adminAuth, async (req, res) => {
+app.get('/api/admin/insights/mark-distribution', churchAuth, async (req, res) => {
   const days = insightsWindow(req);
+  const scope = churchScope(req, 2);
   try {
     const r = await db.query(`
       SELECT mark_type,
              COUNT(*)               AS count,
              COALESCE(SUM(points),0) AS total_points
         FROM teacher_marks
-       WHERE awarded_at >= NOW() - ($1 || ' days')::interval
+       WHERE awarded_at >= NOW() - ($1 || ' days')::interval${scope.sql}
        GROUP BY mark_type
        ORDER BY count DESC
-    `, [String(days)]);
+    `, [String(days), ...scope.params]);
     res.json({ windowDays: days, breakdown: r.rows });
   } catch (e) {
     console.error('insights/mark-distribution:', e.code || '(no code)', e.message);
@@ -1994,17 +2530,29 @@ app.delete('/api/admin/hymns/:number', adminAuth, async (req, res) => {
 // AUTH
 // ─────────────────────────────────────────────────────────────────────────────
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, full_name, role='student' } = req.body;
+  const { email, password, full_name, role='student', church_code } = req.body;
   const safeRole = ['student','teacher'].includes(role) ? role : 'student';
   if (!email||!password) return res.status(400).json({ error:'Email and password required.' });
   if (password.length<6) return res.status(400).json({ error:'Password must be at least 6 characters.' });
+
+  // Teachers MUST provide a valid church invite code so all their data flows
+  // to the right church admin. Students don't need one.
+  let churchId = null;
+  if (safeRole === 'teacher') {
+    const code = (church_code || '').trim().toUpperCase();
+    if (!code) return res.status(400).json({ error: 'Teachers must provide a church invite code.' });
+    const c = await db.query('SELECT id FROM churches WHERE invite_code = $1', [code]);
+    if (!c.rows.length) return res.status(400).json({ error: 'Unknown church code. Ask your church admin for the correct code.' });
+    churchId = c.rows[0].id;
+  }
+
   try {
     const existing = await db.query('SELECT id FROM users WHERE email=$1', [email.toLowerCase()]);
     if (existing.rows.length) return res.status(409).json({ error:'Account already exists.' });
     const hash = await bcrypt.hash(password, 12);
     const r    = await db.query(
-      `INSERT INTO users (email,password_hash,full_name,role) VALUES ($1,$2,$3,$4) RETURNING id,email,full_name,role`,
-      [email.toLowerCase(), hash, full_name||null, safeRole]
+      `INSERT INTO users (email,password_hash,full_name,role,church_id) VALUES ($1,$2,$3,$4,$5) RETURNING id,email,full_name,role,church_id`,
+      [email.toLowerCase(), hash, full_name||null, safeRole, churchId]
     );
     await db.query(
       `INSERT INTO user_profiles (email,display_name) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
@@ -2014,7 +2562,7 @@ app.post('/api/auth/register', async (req, res) => {
     const token = Buffer.from(`${user.email}:${Date.now()}:${Math.random()}`).toString('base64');
     res.status(201).json({
       message:'Account created!',
-      user:{ id:user.id, email:user.email, full_name:user.full_name, role:user.role },
+      user:{ id:user.id, email:user.email, full_name:user.full_name, role:user.role, church_id:user.church_id },
       token,
     });
   } catch (e) { console.error('register:', e.message); res.status(500).json({ error:'Registration failed.' }); }
@@ -2753,6 +3301,127 @@ app.post('/api/teacher/marks', async (req, res) => {
 app.delete('/api/teacher/marks/:markId', async (req, res) => {
   try { await db.query('DELETE FROM teacher_marks WHERE id=$1', [req.params.markId]); res.json({ message:'Mark removed.' }); }
   catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OFFLINE SYNC — drains the teacher's local AsyncStorage queue.
+// Body: {
+//   teacher_email,
+//   classes:    [{ local_id, name, description, category, ... }],   // local-only roster classes
+//   roster:     [{ local_class_id?, server_class_id?, name, email? }],
+//   attendance: [{ local_class_id?, server_class_id?, lesson_number, student_local_id, student_email?, present, marked_at }],
+//   marks:      [{ local_class_id?, server_class_id?, lesson_number, student_local_id, student_email?, mark_type, points, note, awarded_at }],
+// }
+//
+// Returns:
+//   { ok: true, mappings: { classes: { localId: serverId }, students: { localId: email } } }
+//
+// The mappings let the client update its local records' synced=true flag and
+// remember the server IDs so subsequent syncs use them directly.
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/api/teacher/sync', async (req, res) => {
+  const { teacher_email, classes = [], roster = [], attendance = [], marks = [] } = req.body || {};
+  if (!teacher_email) return res.status(400).json({ error: 'teacher_email required.' });
+
+  // Look up the teacher's church_id once — every record gets stamped with it.
+  const u = await db.query('SELECT church_id FROM users WHERE email = $1 AND role = $2', [teacher_email.toLowerCase(), 'teacher']);
+  if (!u.rows.length) return res.status(404).json({ error: 'Teacher account not found.' });
+  const churchId = u.rows[0].church_id;
+  if (!churchId) return res.status(400).json({ error: 'Teacher is not assigned to a church. Ask your church admin to set this up.' });
+
+  const classMap   = {};   // local_id → server_id
+  const studentMap = {};   // local_id → student_email (local students get a synthetic email)
+
+  try {
+    // ── 1. Classes — create any new ones the teacher made offline ────────
+    for (const c of classes) {
+      if (!c?.local_id || !c?.name) continue;
+      // Each church-scoped class gets a unique invite_code
+      let inviteCode, attempts = 0;
+      while (attempts++ < 8) {
+        inviteCode = randCode(6);
+        const dup = await db.query('SELECT 1 FROM classes WHERE invite_code = $1', [inviteCode]);
+        if (!dup.rows.length) break;
+      }
+      const r = await db.query(`
+        INSERT INTO classes (teacher_email, name, description, category, invite_code, church_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+      `, [teacher_email.toLowerCase(), c.name, c.description || null, c.category || 'adult', inviteCode, churchId]);
+      classMap[c.local_id] = r.rows[0].id;
+    }
+
+    // Helper: resolve a record's class_id, preferring the server_class_id if
+    // present (for previously-synced classes), else the freshly-mapped one.
+    const resolveClassId = (rec) =>
+      rec.server_class_id || classMap[rec.local_class_id] || null;
+
+    // ── 2. Roster — for name-only students (no email), synthesize a stable
+    //    pseudo-email so class_members has something to key on. Pattern:
+    //    `local_<teacherDomainSafe>_<localId>@local.gofamint`. This is
+    //    intentionally unguessable by other systems — it's a local marker.
+    const synthEmail = (teacherEmail, localId) =>
+      `local_${teacherEmail.replace(/[^a-z0-9]/g, '')}_${localId}@local.gofamint`;
+
+    for (const m of roster) {
+      const classId = resolveClassId(m);
+      if (!classId || !m.local_id) continue;
+      const email = (m.email && m.email.toLowerCase()) || synthEmail(teacher_email, m.local_id);
+      studentMap[m.local_id] = email;
+      // Keep their display_name in user_profiles so leaderboards can show it
+      if (m.name) {
+        await db.query(`
+          INSERT INTO user_profiles (email, display_name)
+          VALUES ($1, $2)
+          ON CONFLICT (email) DO UPDATE SET display_name = EXCLUDED.display_name
+        `, [email, m.name]);
+      }
+      await db.query(
+        'INSERT INTO class_members (class_id, student_email) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [classId, email]
+      );
+    }
+
+    // ── 3. Attendance ────────────────────────────────────────────────────
+    let attendanceWritten = 0;
+    for (const a of attendance) {
+      const classId = resolveClassId(a);
+      const email   = (a.student_email && a.student_email.toLowerCase())
+                   || studentMap[a.student_local_id];
+      if (!classId || !email || !a.lesson_number) continue;
+      await db.query(`
+        INSERT INTO attendance (class_id, lesson_number, student_email, present, marked_by, marked_at, church_id)
+        VALUES ($1, $2, $3, $4, $5, COALESCE($6::timestamptz, NOW()), $7)
+        ON CONFLICT (class_id, lesson_number, student_email) DO UPDATE SET
+          present = EXCLUDED.present, marked_at = EXCLUDED.marked_at, marked_by = EXCLUDED.marked_by
+      `, [classId, a.lesson_number, email, !!a.present, teacher_email.toLowerCase(), a.marked_at || null, churchId]);
+      attendanceWritten++;
+    }
+
+    // ── 4. Teacher marks ─────────────────────────────────────────────────
+    let marksWritten = 0;
+    for (const m of marks) {
+      const classId = resolveClassId(m);
+      const email   = (m.student_email && m.student_email.toLowerCase())
+                   || studentMap[m.student_local_id];
+      if (!classId || !email || !m.lesson_number || !m.mark_type) continue;
+      await db.query(`
+        INSERT INTO teacher_marks (class_id, lesson_number, student_email, mark_type, points, note, awarded_by, awarded_at, church_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, NOW()), $9)
+      `, [classId, m.lesson_number, email, m.mark_type, parseInt(m.points, 10) || 0, m.note || null, teacher_email.toLowerCase(), m.awarded_at || null, churchId]);
+      marksWritten++;
+    }
+
+    res.json({
+      ok: true,
+      church_id: churchId,
+      mappings:   { classes: classMap, students: studentMap },
+      counts:     { classes: Object.keys(classMap).length, roster: roster.length, attendance: attendanceWritten, marks: marksWritten },
+    });
+  } catch (e) {
+    console.error('teacher/sync:', e.code, e.message);
+    res.status(500).json({ error: 'Sync failed: ' + e.message });
+  }
 });
 
 app.get('/api/teacher/progress', async (req, res) => {
