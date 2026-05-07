@@ -16,7 +16,11 @@ const RESEND_URL = 'https://api.resend.com/emails';
 function getConfig() {
   return {
     apiKey: process.env.RESEND_API_KEY || '',
-    from:   process.env.MAIL_FROM      || 'onboarding@resend.dev',
+    // Default to the gospelar.com sender once the domain is verified in Resend.
+    // Override via MAIL_FROM env var (e.g. set MAIL_FROM=onboarding@resend.dev
+    // while you're still waiting on DNS verification — that sandbox sender
+    // works without any DNS setup but only mails the Resend account owner).
+    from:   process.env.MAIL_FROM      || 'GOFAMINT Sunday School <noreply@gospelar.com>',
   };
 }
 
