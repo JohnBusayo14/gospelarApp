@@ -1748,6 +1748,43 @@ app.post('/api/admin/translations/seed', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error:e.message }); }
 });
 
+// Bulk import every translation row from backend/ui_translations.js — UPSERTs
+// values, so re-running it overwrites with the latest source-of-truth strings.
+// Use this after editing ui_translations.js (or shipping a new version) to
+// push the new strings to the live DB without manual entry. The original
+// /seed endpoint above only writes English placeholders + empty rows; this
+// one writes real translated values for all four languages.
+app.post('/api/admin/translations/import-from-source', adminAuth, async (req, res) => {
+  try {
+    // Lazy-require so the route file doesn't fail to load if the module is
+    // momentarily missing during a deploy hot-swap.
+    const { UI_TRANSLATIONS } = require('./ui_translations');
+
+    let written = 0;
+    let skipped = 0;
+    for (const tr of UI_TRANSLATIONS) {
+      // Skip rows with null/undefined values — leave the existing row alone.
+      if (tr.val == null || tr.val === '') { skipped++; continue; }
+      await db.query(
+        `INSERT INTO translations (lang_code, key, value)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (lang_code, key) DO UPDATE SET value = EXCLUDED.value`,
+        [tr.lang_code, tr.key, tr.val]
+      );
+      written++;
+    }
+    res.json({
+      message: `Imported ${written} translation rows from ui_translations.js`,
+      total:   UI_TRANSLATIONS.length,
+      written,
+      skipped,
+    });
+  } catch (e) {
+    console.error('admin/translations/import-from-source:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/category-language/:categoryId', async (req, res) => {
   try {
     const r = await db.query(
