@@ -850,7 +850,7 @@ app.get('/api/church-admin/teachers', churchAuth, async (req, res) => {
         u.approved_at, u.rejected_at, u.rejected_reason,
         COALESCE(up.display_name, u.full_name)  AS display_name,
         COALESCE(up.avatar_emoji, '👤')         AS avatar_emoji,
-        up.phone, up.location
+        up.church, up.location
       FROM users u
       LEFT JOIN user_profiles up ON up.email = u.email
       WHERE ${where.join(' AND ')}
@@ -1760,19 +1760,36 @@ app.post('/api/admin/translations/import-from-source', adminAuth, async (req, re
     // momentarily missing during a deploy hot-swap.
     const { UI_TRANSLATIONS } = require('./ui_translations');
 
+    // Filter out rows we wouldn't want to write. The previous version did
+    // 1,464 sequential awaits which timed out on Railway's pooler — switch
+    // to ONE multi-row INSERT so the whole import is a single round trip.
+    const rows = UI_TRANSLATIONS.filter((tr) => tr.val != null && tr.val !== '');
+    const skipped = UI_TRANSLATIONS.length - rows.length;
+
+    if (rows.length === 0) {
+      return res.json({ message: 'No rows to import.', total: UI_TRANSLATIONS.length, written: 0, skipped });
+    }
+
+    // Chunk to keep us well under Postgres' 65,535 parameter limit (3 cols × 1500 rows = 4,500).
+    const CHUNK = 500;
     let written = 0;
-    let skipped = 0;
-    for (const tr of UI_TRANSLATIONS) {
-      // Skip rows with null/undefined values — leave the existing row alone.
-      if (tr.val == null || tr.val === '') { skipped++; continue; }
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const slice  = rows.slice(i, i + CHUNK);
+      const params = [];
+      const values = slice.map((tr, idx) => {
+        const o = idx * 3;
+        params.push(tr.lang_code, tr.key, tr.val);
+        return `($${o + 1}, $${o + 2}, $${o + 3})`;
+      }).join(', ');
       await db.query(
         `INSERT INTO translations (lang_code, key, value)
-         VALUES ($1, $2, $3)
+         VALUES ${values}
          ON CONFLICT (lang_code, key) DO UPDATE SET value = EXCLUDED.value`,
-        [tr.lang_code, tr.key, tr.val]
+        params
       );
-      written++;
+      written += slice.length;
     }
+
     res.json({
       message: `Imported ${written} translation rows from ui_translations.js`,
       total:   UI_TRANSLATIONS.length,
