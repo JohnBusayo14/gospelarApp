@@ -3455,14 +3455,41 @@ app.post('/api/verify-payment', async (req, res) => {
   const safeBookId   = book_id && /^[a-z0-9_]{3,64}$/i.test(String(book_id))
     ? String(book_id).toLowerCase()
     : null;
+  // Fail fast if the env var was never set — otherwise Paystack returns 401
+  // and we end up logging a vague "Failed to verify payment" with no clue.
+  if (!process.env.PAYSTACK_SECRET_KEY) {
+    console.error('verify-payment: PAYSTACK_SECRET_KEY is not set on the server');
+    return res.status(500).json({
+      status: 'error',
+      code: 'paystack_key_missing',
+      message: 'Payment provider is not configured. Contact support.',
+    });
+  }
   try {
     const pRes = await axios.get(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
       { headers:{ Authorization:`Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }
     );
     const txn = pRes.data?.data;
-    if (!txn||txn.status!=='success') return res.status(400).json({ status:'error', message:'Payment not successful.' });
-    if (txn.customer?.email?.toLowerCase()!==userEmail) return res.status(400).json({ status:'error', message:'Email mismatch.' });
+    if (!txn) {
+      return res.status(400).json({
+        status: 'error', code: 'paystack_no_data',
+        message: 'Paystack returned no transaction data for this reference.',
+      });
+    }
+    if (txn.status !== 'success') {
+      return res.status(400).json({
+        status: 'error', code: 'txn_not_successful',
+        message: `Transaction status is "${txn.status || 'unknown'}". Only successful charges can be verified.`,
+        gateway_response: txn.gateway_response || null,
+      });
+    }
+    if (txn.customer?.email?.toLowerCase() !== userEmail) {
+      return res.status(400).json({
+        status: 'error', code: 'email_mismatch',
+        message: `Payment email (${txn.customer?.email || '?'}) doesn't match the account email (${userEmail}).`,
+      });
+    }
     const dup = await db.query('SELECT * FROM subscribers WHERE paystack_ref=$1', [reference]);
     if (dup.rows.length) return res.json({ status:'success', data:dup.rows[0] });
 
@@ -3519,8 +3546,24 @@ app.post('/api/verify-payment', async (req, res) => {
       data:r.rows[0],
     });
   } catch (e) {
-    console.error('verify-payment:', e?.response?.data?.message||e.message);
-    res.status(500).json({ status:'error', message:'Failed to verify payment.' });
+    // Surface the upstream cause so the client can show something useful
+    // (and so a future operator can debug from logs without re-deploying).
+    const status   = e?.response?.status || 500;
+    const upstream = e?.response?.data?.message || e?.response?.data || e.message;
+    console.error('verify-payment:', status, upstream);
+    let code = 'verify_failed';
+    if (status === 401) code = 'paystack_auth';   // bad / missing secret key
+    if (status === 404) code = 'paystack_unknown_ref';
+    res.status(status === 401 || status === 404 ? 400 : 500).json({
+      status:  'error',
+      code,
+      message: status === 401
+        ? 'Payment provider rejected our credentials. Contact support.'
+        : status === 404
+          ? 'Paystack does not recognise this transaction reference.'
+          : 'Failed to verify payment. Please try again.',
+      detail:  typeof upstream === 'string' ? upstream : JSON.stringify(upstream),
+    });
   }
 });
 
