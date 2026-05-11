@@ -266,7 +266,7 @@ const initDb = async () => {
       expiry_date         TIMESTAMPTZ,
       paystack_ref        TEXT,
       subscribed_category VARCHAR(20)  DEFAULT 'adult',
-      plan_type           VARCHAR(20)  DEFAULT 'single',
+      plan_type           VARCHAR(64)  DEFAULT 'single',
       price_kobo          INTEGER      DEFAULT 50000,
       created_at          TIMESTAMPTZ  DEFAULT NOW(),
       updated_at          TIMESTAMPTZ  DEFAULT NOW()
@@ -274,8 +274,12 @@ const initDb = async () => {
 
     // Safe migrations for existing databases without these columns
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS subscribed_category VARCHAR(20) DEFAULT 'adult'`,
-    `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS plan_type           VARCHAR(20) DEFAULT 'single'`,
+    `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS plan_type           VARCHAR(64) DEFAULT 'single'`,
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS price_kobo          INTEGER     DEFAULT 50000`,
+    // Widen plan_type on existing prod DBs that originally had VARCHAR(20).
+    // Per-book SKUs like 'book_victory_month_prayer' are 26 chars and
+    // would 22001-truncate without this. Idempotent — no-op if already 64.
+    `ALTER TABLE subscribers ALTER COLUMN plan_type TYPE VARCHAR(64)`,
     // Per-book subscription roster — comma-separated book IDs. Coexists with
     // subscribed_category: that one keeps powering Sunday School age-group
     // gating; this one powers book-level gating (Victory Month Prayer etc.).
