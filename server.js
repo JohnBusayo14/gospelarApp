@@ -276,6 +276,10 @@ const initDb = async () => {
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS subscribed_category VARCHAR(20) DEFAULT 'adult'`,
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS plan_type           VARCHAR(20) DEFAULT 'single'`,
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS price_kobo          INTEGER     DEFAULT 50000`,
+    // Per-book subscription roster — comma-separated book IDs. Coexists with
+    // subscribed_category: that one keeps powering Sunday School age-group
+    // gating; this one powers book-level gating (Victory Month Prayer etc.).
+    `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS subscribed_books    TEXT        DEFAULT ''`,
 
     // ── Subscription plan pricing (admin-editable) ───────────────────────────
     `CREATE TABLE IF NOT EXISTS subscription_plans (
@@ -284,9 +288,18 @@ const initDb = async () => {
       days        INTEGER      NOT NULL DEFAULT 300,
       updated_at  TIMESTAMPTZ  DEFAULT NOW()
     )`,
+    // Widen plan_id BEFORE inserting any book SKU — existing prod DBs have
+    // VARCHAR(20) and book IDs like 'book_victory_month_prayer' (27 chars)
+    // would 22001 truncate without this. New DBs get the widened type from
+    // the CREATE TABLE call up the file (still safe to ALTER as no-op).
+    `ALTER TABLE subscription_plans ALTER COLUMN plan_id TYPE VARCHAR(64)`,
     `INSERT INTO subscription_plans (plan_id, price_kobo, days) VALUES
        ('single', 50000,  300),
-       ('all',    100000, 300)
+       ('all',    100000, 300),
+       -- Per-book SKUs. Adding a new book = one INSERT line here + an entry
+       -- in frontend/data/books.js. Admin Pricing page can edit the price
+       -- after deploy via the same /api/admin/subscription/plans/:id route.
+       ('book_victory_month_prayer', 50000, 365)
      ON CONFLICT (plan_id) DO NOTHING`,
 
     // ── Hymns ────────────────────────────────────────────────────────────────
@@ -476,6 +489,70 @@ const initDb = async () => {
     `ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS last_read_date  DATE`,
     `ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS lifetime_xp     INT  DEFAULT 0`,
     `ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS badges          JSONB DEFAULT '[]'::jsonb`,
+
+    // ── Library: books catalog + per-book daily entries ──────────────────────
+    // Two-shape model: Sunday School (route_screen='HomeScreen') uses its own
+    // categories/units/lessons hierarchy; every other book ('BookReader') uses
+    // the generic book_entries table below — one row per day or vigil session.
+    `CREATE TABLE IF NOT EXISTS books (
+       id              SERIAL        PRIMARY KEY,
+       slug            VARCHAR(60)   UNIQUE NOT NULL,
+       title           VARCHAR(120)  NOT NULL,
+       subtitle        VARCHAR(200),
+       description     TEXT,
+       cover_image_url TEXT,
+       cover_emoji     VARCHAR(10)   DEFAULT '📖',
+       accent_color    VARCHAR(20)   DEFAULT '#1A56DB',
+       route_screen    VARCHAR(40)   DEFAULT 'BookReader',
+       available       BOOLEAN       DEFAULT TRUE,
+       sort_order      INT           DEFAULT 100,
+       language        VARCHAR(10)   DEFAULT 'en',
+       created_at      TIMESTAMPTZ   DEFAULT NOW(),
+       updated_at      TIMESTAMPTZ   DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_books_sort ON books (sort_order, id)`,
+
+    // book_entries — one row per day (entry_type='daily') OR per vigil session
+    // (entry_type IN 'family_vigil','youth_vigil','women_vigil','men_vigil',
+    // 'general_vigil'). UNIQUE constraint lets the admin upsert by (book, day,
+    // type), so re-seeding from the JSON file is idempotent.
+    `CREATE TABLE IF NOT EXISTS book_entries (
+       id                    SERIAL       PRIMARY KEY,
+       book_id               INT          REFERENCES books(id) ON DELETE CASCADE,
+       entry_number          INT          NOT NULL,
+       entry_type            VARCHAR(20)  NOT NULL DEFAULT 'daily',
+       entry_date            DATE,
+       focus                 TEXT,
+       scripture_text        VARCHAR(500),
+       inspirational_message TEXT,
+       prayer_points         JSONB        DEFAULT '[]'::jsonb,
+       special_intercession  TEXT,
+       hymn                  JSONB,
+       discussion_questions  JSONB,
+       declarations          JSONB,
+       sort_order            INT          DEFAULT 100,
+       created_at            TIMESTAMPTZ  DEFAULT NOW(),
+       UNIQUE (book_id, entry_number, entry_type)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_book_entries_book ON book_entries (book_id, entry_number)`,
+
+    // Seed Sunday School inline so the Library is never empty on a fresh DB.
+    // route_screen='HomeScreen' tells the mobile app to send taps into the
+    // existing Sunday School flow (categories → units → lessons) rather than
+    // the generic BookReader screen.
+    `INSERT INTO books (slug, title, subtitle, description, cover_emoji, accent_color, route_screen, sort_order, available)
+     VALUES (
+       'sunday-school',
+       'Sunday School Manual',
+       'GOFAMINT weekly lessons',
+       'Quarterly Sunday School lessons for all four age groups — Children, Intermediate, Youth, and Adult — in English, Yorùbá, Igbo, and Hausa.',
+       '📚',
+       '#1A56DB',
+       'HomeScreen',
+       1,
+       TRUE
+     )
+     ON CONFLICT (slug) DO NOTHING`,
   ];
 
   for (const sql of steps) {
@@ -3351,12 +3428,33 @@ app.put('/api/admin/subscription/plans/:planId', adminAuth, async (req, res) => 
   }
 });
 
+// Parse the comma-separated subscribed_books column into a clean array.
+// Trims, lowercases, drops empties — defensive because admin tools may edit it.
+const parseBooks = (raw) =>
+  String(raw || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+// Append a book id (de-duped) to the existing comma-separated list.
+const addBookToList = (raw, bookId) => {
+  const set = new Set(parseBooks(raw));
+  set.add(String(bookId).toLowerCase());
+  return Array.from(set).join(',');
+};
+
 app.post('/api/verify-payment', async (req, res) => {
-  const { reference, email, category='adult' } = req.body;
+  const { reference, email, category='adult', book_id=null } = req.body;
   if (!reference||!email) return res.status(400).json({ status:'error', message:'reference and email required.' });
   if (!isValidEmail(email)) return res.status(400).json({ status:'error', message:'Invalid email.' });
   const userEmail    = email.toLowerCase();
   const safeCategory = VALID_CATS.includes(category) ? category : 'adult';
+  // Book-SKU path: when a book_id is present, this is a per-book purchase
+  // (Victory Month Prayer etc.) and we resolve pricing via the book's
+  // dedicated plan row instead of the single/all category plans.
+  const safeBookId   = book_id && /^[a-z0-9_]{3,64}$/i.test(String(book_id))
+    ? String(book_id).toLowerCase()
+    : null;
   try {
     const pRes = await axios.get(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
@@ -3367,6 +3465,37 @@ app.post('/api/verify-payment', async (req, res) => {
     if (txn.customer?.email?.toLowerCase()!==userEmail) return res.status(400).json({ status:'error', message:'Email mismatch.' });
     const dup = await db.query('SELECT * FROM subscribers WHERE paystack_ref=$1', [reference]);
     if (dup.rows.length) return res.json({ status:'success', data:dup.rows[0] });
+
+    if (safeBookId) {
+      // Per-book SKU: leave subscribed_category alone, append to subscribed_books.
+      const planId   = `book_${safeBookId}`;
+      const plan     = await getPlanPricing(planId).catch(() => ({ price_kobo: 50000, days: 365 }));
+      const now      = new Date(), exp = addDays(now, plan.days);
+      const priceKobo = txn.amount || plan.price_kobo;
+      // Read existing books so the append is non-destructive.
+      const existing = await db.query('SELECT subscribed_books FROM subscribers WHERE email=$1', [userEmail]);
+      const newBooks = addBookToList(existing.rows[0]?.subscribed_books, safeBookId);
+      const r = await db.query(`
+        INSERT INTO subscribers
+          (email,is_active,subscription_date,expiry_date,paystack_ref,subscribed_books,price_kobo,plan_type)
+        VALUES ($1,TRUE,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (email) DO UPDATE SET is_active=TRUE,
+          subscription_date=EXCLUDED.subscription_date, expiry_date=EXCLUDED.expiry_date,
+          paystack_ref=EXCLUDED.paystack_ref, subscribed_books=EXCLUDED.subscribed_books,
+          price_kobo=EXCLUDED.price_kobo, plan_type=EXCLUDED.plan_type, updated_at=NOW()
+        RETURNING *
+      `, [userEmail, now, exp, reference, newBooks, priceKobo, planId]);
+      console.log('[Sub] Activated %s → book:%s plan:%s', userEmail, safeBookId, planId);
+      return res.json({
+        status:'success', success:true, expiry_date:r.rows[0].expiry_date,
+        book_id: safeBookId, plan_type: planId, price_kobo: priceKobo,
+        subscribed_books: parseBooks(newBooks),
+        // Echo category fields for backward compat with old clients.
+        subscribed_category: r.rows[0].subscribed_category, data: r.rows[0],
+      });
+    }
+
+    // Category SKU (Sunday School) — original behavior.
     const planType = safeCategory==='all' ? 'all' : 'single';
     const plan     = await getPlanPricing(planType);
     const now      = new Date(), exp = addDays(now, plan.days);
@@ -3385,7 +3514,9 @@ app.post('/api/verify-payment', async (req, res) => {
     console.log('[Sub] Activated %s → plan:%s cat:%s', userEmail, planType, safeCategory);
     res.json({
       status:'success', success:true, expiry_date:r.rows[0].expiry_date,
-      subscribed_category:safeCategory, plan_type:planType, price_kobo:priceKobo, data:r.rows[0],
+      subscribed_category:safeCategory, plan_type:planType, price_kobo:priceKobo,
+      subscribed_books: parseBooks(r.rows[0].subscribed_books),
+      data:r.rows[0],
     });
   } catch (e) {
     console.error('verify-payment:', e?.response?.data?.message||e.message);
@@ -3430,10 +3561,11 @@ app.get('/api/subscription/status/:email', async (req, res) => {
   try {
     const r = await db.query(`
       SELECT is_active, expiry_date, subscribed_category, plan_type, price_kobo,
+             subscribed_books,
              (is_active=TRUE AND expiry_date IS NOT NULL AND expiry_date>NOW()) AS active
       FROM subscribers WHERE LOWER(email)=LOWER($1)
     `, [req.params.email]);
-    if (!r.rows.length) return res.json({ active:false, expiry_date:null });
+    if (!r.rows.length) return res.json({ active:false, expiry_date:null, subscribed_books:[] });
     const sub = r.rows[0];
     let days_remaining = null;
     if (sub.expiry_date) {
@@ -3443,6 +3575,9 @@ app.get('/api/subscription/status/:email', async (req, res) => {
       active:sub.active===true, expiry_date:sub.expiry_date, days_remaining,
       subscribed_category:sub.subscribed_category||'adult',
       plan_type:sub.plan_type||'single', price_kobo:sub.price_kobo||50000,
+      // Parsed array of book IDs the user has paid for. Empty if they only
+      // bought the legacy category-based Sunday School plans.
+      subscribed_books: parseBooks(sub.subscribed_books),
     });
   } catch (e) { return res.status(500).json({ error:e.message }); }
 });
@@ -3469,6 +3604,30 @@ app.get('/api/subscription/can-access/:email/:categoryId', async (req, res) => {
   } catch (e) { res.status(500).json({ canAccess:false, reason:'server_error' }); }
 });
 
+// Authoritative server-side gate for per-book SKUs (Victory Month Prayer etc.).
+// Sibling to /can-access/:categoryId — different scope, different reasons.
+app.get('/api/subscription/can-access-book/:email/:bookId', async (req, res) => {
+  const { email, bookId } = req.params;
+  if (!email || !bookId) return res.status(400).json({ canAccess:false, reason:'missing_params' });
+  try {
+    const r = await db.query(`
+      SELECT is_active, expiry_date, subscribed_books,
+             (is_active=TRUE AND expiry_date IS NOT NULL AND expiry_date>NOW()) AS active
+      FROM subscribers WHERE LOWER(email)=LOWER($1)
+    `, [email]);
+    if (!r.rows.length) return res.json({ canAccess:false, reason:'no_subscription' });
+    const sub = r.rows[0];
+    if (!sub.active) return res.json({ canAccess:false, reason:'expired' });
+    const books   = parseBooks(sub.subscribed_books);
+    const owned   = books.includes(String(bookId).toLowerCase());
+    return res.json({
+      canAccess: owned,
+      reason: owned ? 'book_owned' : 'not_purchased',
+      subscribed_books: books,
+    });
+  } catch (e) { res.status(500).json({ canAccess:false, reason:'server_error' }); }
+});
+
 app.get('/api/check-status/:email', async (req, res) => {
   const email = req.params.email?.toLowerCase().trim();
   if (!email||!isValidEmail(email)) return res.status(400).json({ canAccess:false, reason:'Invalid email.' });
@@ -3488,10 +3647,14 @@ app.get('/api/subscribers', adminAuth, async (req, res) => {
   try {
     const r = await db.query(`
       SELECT id,email,is_active,subscription_date,expiry_date,
-             subscribed_category,plan_type,price_kobo,paystack_ref,created_at,updated_at
+             subscribed_category,plan_type,price_kobo,paystack_ref,
+             subscribed_books, created_at,updated_at
       FROM subscribers ORDER BY created_at DESC
     `);
-    res.json({ count:r.rows.length, subscribers:r.rows });
+    res.json({
+      count: r.rows.length,
+      subscribers: r.rows.map((s) => ({ ...s, subscribed_books: parseBooks(s.subscribed_books) })),
+    });
   } catch (e) { res.status(500).json({ message:e.message }); }
 });
 
@@ -4083,6 +4246,238 @@ app.get('/api/teacher/progress', async (req, res) => {
     `, [class_id]);
     res.json(r.rows);
   } catch (e) { res.status(500).json({ error:e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIBRARY — books catalog + per-book daily entries
+// Public reads (no auth) match the trust model of /api/lessons.
+// Admin writes are gated by the existing adminAuth middleware.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/books — list of books for the library.
+// By default returns only available books, ordered by sort_order then id.
+// Pass ?include=unavailable to return everything (admin/debug).
+app.get('/api/books', async (req, res) => {
+  const includeUnavailable = req.query.include === 'unavailable';
+  try {
+    const r = await db.query(`
+      SELECT id, slug, title, subtitle, description, cover_image_url, cover_emoji,
+             accent_color, route_screen, available, sort_order, language,
+             created_at, updated_at,
+             (SELECT COUNT(*) FROM book_entries WHERE book_id = books.id) AS entries_count
+        FROM books
+       ${includeUnavailable ? '' : 'WHERE available = TRUE'}
+       ORDER BY sort_order ASC, id ASC
+    `);
+    res.json(r.rows);
+  } catch (e) {
+    console.error('GET /api/books:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load books.' });
+  }
+});
+
+// GET /api/books/:slug — single book metadata.
+app.get('/api/books/:slug', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT id, slug, title, subtitle, description, cover_image_url, cover_emoji,
+             accent_color, route_screen, available, sort_order, language,
+             created_at, updated_at
+        FROM books WHERE slug = $1
+    `, [req.params.slug]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Book not found.' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('GET /api/books/:slug:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load book.' });
+  }
+});
+
+// GET /api/books/:slug/entries — list of entries (lightweight, for the day-selector).
+// Returns id, entry_number, entry_type, focus, scripture_text, entry_date — no
+// long-form fields. Use GET /api/books/:slug/entries/:number for the full row.
+app.get('/api/books/:slug/entries', async (req, res) => {
+  try {
+    const r = await db.query(`
+      SELECT e.id, e.entry_number, e.entry_type, e.entry_date, e.focus, e.scripture_text, e.sort_order
+        FROM book_entries e
+        JOIN books b ON b.id = e.book_id
+       WHERE b.slug = $1
+       ORDER BY e.entry_type, e.entry_number
+    `, [req.params.slug]);
+    res.json({ slug: req.params.slug, count: r.rows.length, entries: r.rows });
+  } catch (e) {
+    console.error('GET /api/books/:slug/entries:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load entries.' });
+  }
+});
+
+// GET /api/books/:slug/entries/:number?type=daily — full content of one entry.
+// Defaults type to 'daily'; pass ?type=family_vigil etc. for vigil sessions.
+app.get('/api/books/:slug/entries/:number', async (req, res) => {
+  const number = parseInt(req.params.number, 10);
+  const type   = String(req.query.type || 'daily');
+  if (!Number.isFinite(number)) return res.status(400).json({ error: 'Invalid entry number.' });
+  try {
+    const r = await db.query(`
+      SELECT e.*
+        FROM book_entries e
+        JOIN books b ON b.id = e.book_id
+       WHERE b.slug = $1 AND e.entry_number = $2 AND e.entry_type = $3
+    `, [req.params.slug, number, type]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Entry not found.' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('GET /api/books/:slug/entries/:number:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load entry.' });
+  }
+});
+
+// POST /api/admin/books — create a book.
+app.post('/api/admin/books', adminAuth, async (req, res) => {
+  const {
+    slug, title, subtitle, description, cover_image_url, cover_emoji,
+    accent_color, route_screen, available, sort_order, language,
+  } = req.body || {};
+  if (!slug || !title) return res.status(400).json({ error: 'slug and title are required.' });
+  try {
+    const r = await db.query(`
+      INSERT INTO books (slug, title, subtitle, description, cover_image_url, cover_emoji,
+                         accent_color, route_screen, available, sort_order, language)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *
+    `, [
+      String(slug).trim().toLowerCase(),
+      title.trim(),
+      (subtitle || '').trim() || null,
+      (description || '').trim() || null,
+      (cover_image_url || '').trim() || null,
+      (cover_emoji || '📖').slice(0, 10),
+      (accent_color || '#1A56DB').slice(0, 20),
+      (route_screen || 'BookReader').slice(0, 40),
+      available !== false,
+      Number.isFinite(parseInt(sort_order, 10)) ? parseInt(sort_order, 10) : 100,
+      (language || 'en').slice(0, 10),
+    ]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'A book with that slug already exists.' });
+    console.error('POST /api/admin/books:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to create book.' });
+  }
+});
+
+// PUT /api/admin/books/:id — update metadata. Any field may be omitted.
+app.put('/api/admin/books/:id', adminAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid id.' });
+  // Whitelist updatable columns and build a dynamic SET clause so unknown
+  // fields can't sneak in. updated_at always bumped.
+  const allowed = [
+    'title', 'subtitle', 'description', 'cover_image_url', 'cover_emoji',
+    'accent_color', 'route_screen', 'available', 'sort_order', 'language',
+  ];
+  const sets   = ['updated_at = NOW()'];
+  const params = [];
+  for (const k of allowed) {
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, k)) {
+      params.push(req.body[k]);
+      sets.push(`${k} = $${params.length}`);
+    }
+  }
+  if (params.length === 0) return res.status(400).json({ error: 'No updatable fields supplied.' });
+  params.push(id);
+  try {
+    const r = await db.query(
+      `UPDATE books SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Book not found.' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('PUT /api/admin/books/:id:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to update book.' });
+  }
+});
+
+// POST /api/admin/books/:id/entries — upsert one entry. Same endpoint handles
+// both create (new entry_number) and edit (existing one) via ON CONFLICT.
+// This is what the seed-victory-month.js script uses too.
+app.post('/api/admin/books/:id/entries', adminAuth, async (req, res) => {
+  const bookId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(bookId)) return res.status(400).json({ error: 'Invalid book id.' });
+  const {
+    entry_number, entry_type = 'daily', entry_date,
+    focus, scripture_text, inspirational_message,
+    prayer_points, special_intercession, hymn,
+    discussion_questions, declarations, sort_order,
+  } = req.body || {};
+  if (!Number.isFinite(parseInt(entry_number, 10))) {
+    return res.status(400).json({ error: 'entry_number required.' });
+  }
+  try {
+    const r = await db.query(`
+      INSERT INTO book_entries (
+        book_id, entry_number, entry_type, entry_date,
+        focus, scripture_text, inspirational_message,
+        prayer_points, special_intercession, hymn,
+        discussion_questions, declarations, sort_order
+      )
+      VALUES ($1, $2, $3, $4::date, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13)
+      ON CONFLICT (book_id, entry_number, entry_type) DO UPDATE SET
+        entry_date            = EXCLUDED.entry_date,
+        focus                 = EXCLUDED.focus,
+        scripture_text        = EXCLUDED.scripture_text,
+        inspirational_message = EXCLUDED.inspirational_message,
+        prayer_points         = EXCLUDED.prayer_points,
+        special_intercession  = EXCLUDED.special_intercession,
+        hymn                  = EXCLUDED.hymn,
+        discussion_questions  = EXCLUDED.discussion_questions,
+        declarations          = EXCLUDED.declarations,
+        sort_order            = EXCLUDED.sort_order
+      RETURNING *
+    `, [
+      bookId,
+      parseInt(entry_number, 10),
+      String(entry_type),
+      entry_date || null,
+      focus || null,
+      scripture_text || null,
+      inspirational_message || null,
+      JSON.stringify(prayer_points || []),
+      special_intercession || null,
+      hymn ? JSON.stringify(hymn) : null,
+      discussion_questions ? JSON.stringify(discussion_questions) : null,
+      declarations ? JSON.stringify(declarations) : null,
+      Number.isFinite(parseInt(sort_order, 10)) ? parseInt(sort_order, 10) : 100,
+    ]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    if (e.code === '23503') return res.status(404).json({ error: 'Book not found.' });
+    console.error('POST /api/admin/books/:id/entries:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to upsert entry.' });
+  }
+});
+
+// DELETE /api/admin/books/:id/entries/:number?type=daily — remove one entry.
+app.delete('/api/admin/books/:id/entries/:number', adminAuth, async (req, res) => {
+  const bookId = parseInt(req.params.id, 10);
+  const number = parseInt(req.params.number, 10);
+  const type   = String(req.query.type || 'daily');
+  if (!Number.isFinite(bookId) || !Number.isFinite(number)) {
+    return res.status(400).json({ error: 'Invalid id or entry number.' });
+  }
+  try {
+    const r = await db.query(
+      'DELETE FROM book_entries WHERE book_id = $1 AND entry_number = $2 AND entry_type = $3 RETURNING id',
+      [bookId, number, type]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Entry not found.' });
+    res.json({ ok: true, deleted: r.rows[0].id });
+  } catch (e) {
+    console.error('DELETE /api/admin/books/:id/entries:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to delete entry.' });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
