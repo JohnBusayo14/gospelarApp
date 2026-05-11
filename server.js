@@ -3447,6 +3447,134 @@ const addBookToList = (raw, bookId) => {
   return Array.from(set).join(',');
 };
 
+// POST /api/payments/initialize
+// Server-side Paystack initialize — replaces the previous client-side
+// inline.js flow. Frontend posts { email, plan, category?, book_id? },
+// server resolves the right amount from the subscription_plans table
+// (so the price can never be tampered with from the device), calls
+// Paystack with the secret key, and returns {authorization_url, reference}.
+// Frontend opens authorization_url in a WebView and listens for the
+// callback redirect — same WebView pattern as before, just without the
+// public key in the bundle.
+app.post('/api/payments/initialize', async (req, res) => {
+  const { email, plan = 'single', category = 'adult', book_id = null } = req.body || {};
+  if (!email)             return res.status(400).json({ status: 'error', code: 'missing_email',   message: 'email required.' });
+  if (!isValidEmail(email)) return res.status(400).json({ status: 'error', code: 'invalid_email', message: 'Invalid email.' });
+
+  if (!process.env.PAYSTACK_SECRET_KEY) {
+    console.error('payments/initialize: PAYSTACK_SECRET_KEY not set');
+    return res.status(500).json({
+      status: 'error', code: 'paystack_key_missing',
+      message: 'Payment provider is not configured. Contact support.',
+    });
+  }
+
+  // Resolve the SKU. Per-book purchases use 'book_<slug>'; otherwise it's
+  // the legacy single/all category plan.
+  const safeBookId = book_id && /^[a-z0-9_]{3,64}$/i.test(String(book_id))
+    ? String(book_id).toLowerCase() : null;
+  const planId = safeBookId
+    ? `book_${safeBookId}`
+    : (plan === 'all' ? 'all' : 'single');
+  const safeCategory = VALID_CATS.includes(category) ? category : 'adult';
+
+  let pricing;
+  try {
+    pricing = await getPlanPricing(planId);
+  } catch (e) {
+    pricing = { price_kobo: safeBookId ? 50000 : (planId === 'all' ? 100000 : 50000), days: safeBookId ? 365 : 300 };
+  }
+
+  // Reference includes the planId so server-side logs are easy to grep
+  // when something goes wrong on a specific SKU.
+  const reference = `Gospelar_${Date.now()}_${Math.random().toString(36).slice(2, 11)}_${planId}`.slice(0, 100);
+
+  // The WebView watches its own navigation and intercepts this exact URL —
+  // the host doesn't have to actually be reachable, but if it is (it is,
+  // we serve /api/payments/callback above), we get a friendly "Payment
+  // received" splash for the half-second between Paystack and verify.
+  const PUBLIC_BASE = process.env.PUBLIC_API_URL
+    || `${req.protocol}://${req.get('host')}`;
+  const callbackUrl = `${PUBLIC_BASE.replace(/\/$/, '')}/api/payments/callback`;
+
+  try {
+    const initRes = await axios.post(
+      'https://api.paystack.co/transaction/initialize',
+      {
+        email:        email.toLowerCase(),
+        amount:       pricing.price_kobo,
+        currency:     'NGN',
+        reference,
+        callback_url: callbackUrl,
+        metadata: {
+          plan_id:  planId,
+          category: planId === 'all' || safeBookId ? null : safeCategory,
+          book_id:  safeBookId,
+          custom_fields: [
+            { display_name: 'Plan',     variable_name: 'plan_id',  value: planId },
+            { display_name: 'Category', variable_name: 'category', value: safeBookId ? '—' : safeCategory },
+          ],
+        },
+      },
+      { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    const data = initRes.data?.data;
+    if (!data?.authorization_url) {
+      return res.status(502).json({
+        status: 'error', code: 'paystack_no_url',
+        message: 'Paystack did not return an authorization URL.',
+        detail:  initRes.data?.message || null,
+      });
+    }
+    res.json({
+      status:            'success',
+      authorization_url: data.authorization_url,
+      access_code:       data.access_code,
+      reference:         data.reference,
+      amount_kobo:       pricing.price_kobo,
+      plan_id:           planId,
+      category:          safeBookId ? null : safeCategory,
+      book_id:           safeBookId,
+    });
+  } catch (e) {
+    const status   = e?.response?.status || 500;
+    const upstream = e?.response?.data?.message || e?.response?.data || e.message;
+    console.error('payments/initialize:', status, upstream);
+    res.status(status === 401 ? 400 : 502).json({
+      status:  'error',
+      code:    status === 401 ? 'paystack_auth' : 'paystack_init_failed',
+      message: status === 401
+        ? 'Payment provider rejected our credentials. Contact support.'
+        : 'Failed to initialize payment. Please try again.',
+      detail:  typeof upstream === 'string' ? upstream : JSON.stringify(upstream),
+    });
+  }
+});
+
+// GET /api/payments/callback?reference=…
+// Paystack redirects the user's WebView here after a successful payment.
+// The mobile app's WebView intercepts this URL via onNavigationStateChange,
+// reads the `reference` query param, and calls /api/verify-payment with it.
+// We just render a tiny "Payment received" page so the user sees something
+// in the brief moment between Paystack closing and the app verifying.
+app.get('/api/payments/callback', (req, res) => {
+  const ref = String(req.query.reference || req.query.trxref || '');
+  res.set('Content-Type', 'text/html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Payment received</title>
+<style>html,body{margin:0;height:100%;background:#0F172A;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;align-items:center;justify-content:center;}
+.b{text-align:center;max-width:320px;padding:24px;}
+.s{width:64px;height:64px;border:5px solid rgba(255,255,255,.18);border-top-color:#10B981;border-radius:50%;animation:spin .9s linear infinite;margin:0 auto 18px;}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{font-size:18px;margin:0 0 8px;font-weight:800}
+p{font-size:13px;color:rgba(255,255,255,.6);margin:0;line-height:1.5}</style>
+</head><body><div class="b">
+<div class="s"></div>
+<h1>Payment received</h1>
+<p>Verifying with Paystack — your subscription will activate in a moment.</p>
+</div></body></html>`);
+});
+
 app.post('/api/verify-payment', async (req, res) => {
   const { reference, email, category='adult', book_id=null } = req.body;
   if (!reference||!email) return res.status(400).json({ status:'error', message:'reference and email required.' });
