@@ -285,6 +285,18 @@ const initDb = async () => {
     // gating; this one powers book-level gating (Victory Month Prayer etc.).
     `ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS subscribed_books    TEXT        DEFAULT ''`,
 
+    // ── 2026-05 fix: prevent the DEFAULT 'adult' on subscribed_category from
+    //    leaking Sunday-School access to users who only bought a book.
+    //
+    // The column default still exists (so legacy /api/subscription/verify
+    // category-only flow keeps working), but for any row whose plan_type is
+    // a book SKU (`book_*`), we clear subscribed_category to NULL so they
+    // can no longer pass the SS gate. Idempotent — safe to re-run.
+    `UPDATE subscribers
+        SET subscribed_category = NULL
+      WHERE plan_type LIKE 'book_%'
+        AND subscribed_category IS NOT NULL`,
+
     // ── Subscription plan pricing (admin-editable) ───────────────────────────
     `CREATE TABLE IF NOT EXISTS subscription_plans (
       plan_id     VARCHAR(20)  PRIMARY KEY,
@@ -3767,30 +3779,51 @@ app.post('/api/verify-payment', async (req, res) => {
     if (dup.rows.length) return res.json({ status:'success', data:dup.rows[0] });
 
     if (safeBookId) {
-      // Per-book SKU: leave subscribed_category alone, append to subscribed_books.
+      // Per-book SKU. Bug history:
+      //   • On INSERT, subscribed_category was unspecified → DB DEFAULT 'adult'
+      //     kicked in → a book-only buyer accidentally got Sunday-School Adult
+      //     access for free.
+      //   • On UPDATE, plan_type was overwritten → a Sunday-School subscriber
+      //     buying a book lost their SS plan_type ('single'/'all').
+      // Fix: explicit NULL category on fresh rows; preserve an existing
+      //      Sunday-School plan_type; take the later of the two expiries.
       const planId   = `book_${safeBookId}`;
       const plan     = await getPlanPricing(planId).catch(() => ({ price_kobo: 50000, days: 365 }));
       const now      = new Date(), exp = addDays(now, plan.days);
       const priceKobo = txn.amount || plan.price_kobo;
-      // Read existing books so the append is non-destructive.
       const existing = await db.query('SELECT subscribed_books FROM subscribers WHERE email=$1', [userEmail]);
       const newBooks = addBookToList(existing.rows[0]?.subscribed_books, safeBookId);
       const r = await db.query(`
         INSERT INTO subscribers
-          (email,is_active,subscription_date,expiry_date,paystack_ref,subscribed_books,price_kobo,plan_type)
-        VALUES ($1,TRUE,$2,$3,$4,$5,$6,$7)
-        ON CONFLICT (email) DO UPDATE SET is_active=TRUE,
-          subscription_date=EXCLUDED.subscription_date, expiry_date=EXCLUDED.expiry_date,
-          paystack_ref=EXCLUDED.paystack_ref, subscribed_books=EXCLUDED.subscribed_books,
-          price_kobo=EXCLUDED.price_kobo, plan_type=EXCLUDED.plan_type, updated_at=NOW()
+          (email,is_active,subscription_date,expiry_date,paystack_ref,
+           subscribed_books,price_kobo,plan_type,subscribed_category)
+        VALUES ($1,TRUE,$2,$3,$4,$5,$6,$7,NULL)
+        ON CONFLICT (email) DO UPDATE SET
+          is_active         = TRUE,
+          subscription_date = EXCLUDED.subscription_date,
+          expiry_date       = GREATEST(subscribers.expiry_date, EXCLUDED.expiry_date),
+          paystack_ref      = EXCLUDED.paystack_ref,
+          subscribed_books  = EXCLUDED.subscribed_books,
+          price_kobo        = EXCLUDED.price_kobo,
+          -- Preserve a Sunday-School plan_type if the buyer already had one;
+          -- otherwise record the book plan. Never let a book purchase strip
+          -- a paying Sunday-School subscriber of their plan.
+          plan_type         = CASE
+                                WHEN subscribers.plan_type IN ('single','all')
+                                  THEN subscribers.plan_type
+                                ELSE EXCLUDED.plan_type
+                              END,
+          -- subscribed_category is INTENTIONALLY omitted from the SET list so
+          -- existing Sunday-School category survives, and a fresh book-only
+          -- buyer doesn't inherit the DEFAULT 'adult' from the column spec.
+          updated_at        = NOW()
         RETURNING *
       `, [userEmail, now, exp, reference, newBooks, priceKobo, planId]);
       console.log('[Sub] Activated %s → book:%s plan:%s', userEmail, safeBookId, planId);
       return res.json({
         status:'success', success:true, expiry_date:r.rows[0].expiry_date,
-        book_id: safeBookId, plan_type: planId, price_kobo: priceKobo,
+        book_id: safeBookId, plan_type: r.rows[0].plan_type, price_kobo: priceKobo,
         subscribed_books: parseBooks(newBooks),
-        // Echo category fields for backward compat with old clients.
         subscribed_category: r.rows[0].subscribed_category, data: r.rows[0],
       });
     }
@@ -3840,10 +3873,17 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Used by the app's SubscriptionContext
+// Used by the app's SubscriptionContext. Older clients still POST here for
+// category purchases. New clients use /api/verify-payment which also handles
+// per-book SKUs. We accept `book_id` here too for forward-compat and route
+// to the book-purchase shape so the bug fix is honoured regardless of which
+// endpoint the client picks.
 app.post('/api/subscription/verify', async (req, res) => {
-  const { reference, email, category='adult' } = req.body;
+  const { reference, email, category='adult', book_id=null } = req.body;
   if (!reference||!email) return res.status(400).json({ success:false, message:'Missing reference or email' });
+  const safeBookId = book_id && /^[a-z0-9_]{3,64}$/i.test(String(book_id))
+    ? String(book_id).toLowerCase()
+    : null;
   try {
     const pRes = await axios.get(
       `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
@@ -3851,6 +3891,43 @@ app.post('/api/subscription/verify', async (req, res) => {
     );
     if (!pRes.data.status||pRes.data.data?.status!=='success')
       return res.json({ success:false, message:'Payment not confirmed by Paystack.' });
+
+    // Per-book branch — mirrors /api/verify-payment so the leakage fix
+    // applies on this endpoint too.
+    if (safeBookId) {
+      const planId   = `book_${safeBookId}`;
+      const plan     = await getPlanPricing(planId).catch(() => ({ price_kobo: 50000, days: 365 }));
+      const exp      = new Date(); exp.setDate(exp.getDate()+plan.days);
+      const expiry   = exp.toISOString();
+      const priceKobo= plan.price_kobo;
+      const existing = await db.query('SELECT subscribed_books FROM subscribers WHERE email=$1', [email]);
+      const newBooks = addBookToList(existing.rows[0]?.subscribed_books, safeBookId);
+      await db.query(`
+        INSERT INTO subscribers
+          (email,is_active,expiry_date,paystack_ref,subscription_date,
+           subscribed_books,plan_type,price_kobo,subscribed_category)
+        VALUES ($1,TRUE,$2,$3,NOW(),$4,$5,$6,NULL)
+        ON CONFLICT (email) DO UPDATE SET
+          is_active        = TRUE,
+          expiry_date      = GREATEST(subscribers.expiry_date, EXCLUDED.expiry_date),
+          paystack_ref     = EXCLUDED.paystack_ref,
+          subscription_date= NOW(),
+          subscribed_books = EXCLUDED.subscribed_books,
+          plan_type        = CASE
+                               WHEN subscribers.plan_type IN ('single','all')
+                                 THEN subscribers.plan_type
+                               ELSE EXCLUDED.plan_type
+                             END,
+          price_kobo       = EXCLUDED.price_kobo,
+          updated_at       = NOW()
+      `, [email, expiry, reference, newBooks, planId, priceKobo]);
+      console.log('✅ subscription/verify: %s → book:%s', email, safeBookId);
+      return res.json({
+        success:true, expiry_date:expiry, plan_type:planId,
+        book_id:safeBookId, subscribed_books: parseBooks(newBooks),
+      });
+    }
+
     const safeCategory = VALID_CATS.includes(category) ? category : 'adult';
     const planType     = safeCategory==='all' ? 'all' : 'single';
     const plan         = await getPlanPricing(planType);
