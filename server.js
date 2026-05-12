@@ -4,7 +4,7 @@ const crypto  = require('crypto');
 const cors    = require('cors');
 const axios   = require('axios');
 const db      = require('./db');
-const { sendApprovalEmail, sendRejectionEmail } = require('./services/mailer');
+const { sendApprovalEmail, sendRejectionEmail, sendMail } = require('./services/mailer');
 require('dotenv').config();
 
 const app = express();
@@ -557,6 +557,25 @@ const initDb = async () => {
        TRUE
      )
      ON CONFLICT (slug) DO NOTHING`,
+
+    // Seed the Victory Month Prayer book row so the admin dashboard and the
+    // mobile app can both reach it via slug. Entries (the 30 days + 6 vigils)
+    // are NOT seeded here — they're loaded from the bundled JS data the first
+    // time the admin presses "Seed initial content" in the dashboard, which
+    // POSTs into /api/admin/books/:slug/seed.
+    `INSERT INTO books (slug, title, subtitle, description, cover_emoji, accent_color, route_screen, sort_order, available)
+     VALUES (
+       'victory-month-prayer',
+       'Victory Month Prayer',
+       '31-day prayer focus',
+       'Walk through 30 days of Spirit-led prayer, scripture meditation, and bold declarations. Each day pairs a focused theme with practical prayer points and a reflection prompt.',
+       '🕊️',
+       '#F97316',
+       'VictoryMonthHome',
+       2,
+       TRUE
+     )
+     ON CONFLICT (slug) DO NOTHING`,
   ];
 
   for (const sql of steps) {
@@ -925,6 +944,128 @@ app.post('/api/admin/church-applications/:id/reject', adminAuth, async (req, res
     console.error('POST /api/admin/church-applications/:id/reject:', e.code, e.message);
     res.status(500).json({ error: 'Reject failed.' });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIL HEALTH CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+// Two endpoints so the dashboard / Postman can verify the Resend pipeline
+// without writing CLI scripts:
+//
+//   GET  /api/admin/mail-test   → safe config probe. Reports whether the API
+//                                 key is present, what MAIL_FROM looks like,
+//                                 whether the sandbox sender is in use, and
+//                                 (when possible) the list of verified
+//                                 domains on the Resend account. No email
+//                                 is sent — costs zero send quota.
+//   POST /api/admin/mail-test   → actually sends one test email to the
+//                                 address in body.to. Returns the Resend
+//                                 message id on success or the error code.
+//
+// Both endpoints are admin-only (x-admin-key). They never throw — every
+// failure path returns 200 with { ok: false, error } so the dashboard can
+// render a friendly diagnostic instead of a raw 500.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Inspect Resend account state. Best-effort: API errors are reported in
+// the response body rather than thrown.
+const probeResendDomains = async (apiKey) => {
+  if (!apiKey) return { ok: false, error: 'no_api_key' };
+  try {
+    const r = await fetch('https://api.resend.com/domains', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const data = await r.json().catch(() => ({}));
+    // 401 'restricted_api_key' is normal for a send-only key — the key works
+    // for sending, it just can't list domains. We surface that as "ok but
+    // can't introspect" so the UI knows not to scare the user.
+    if (r.status === 401 && /restricted/i.test(data?.name || data?.message || '')) {
+      return { ok: true, restricted: true, domains: [], note: 'API key is send-only — cannot list domains.' };
+    }
+    if (!r.ok) return { ok: false, error: data?.message || `HTTP ${r.status}` };
+    const domains = (data?.data || data || []).map((d) => ({
+      name:   d.name,
+      status: d.status,                          // 'verified' | 'pending' | 'failed' | ...
+      region: d.region,
+    }));
+    return { ok: true, domains };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+};
+
+// GET /api/admin/mail-test — health probe, doesn't send anything.
+app.get('/api/admin/mail-test', adminAuth, async (req, res) => {
+  const apiKey  = process.env.RESEND_API_KEY || '';
+  const from    = process.env.MAIL_FROM || 'Gospelar Sunday School <noreply@gospelar.com>';
+  const fromAddr = (from.match(/<([^>]+)>/)?.[1] || from).trim().toLowerCase();
+  const sandbox = /resend\.dev>?$|<onboarding@resend\.dev>/i.test(from) || fromAddr.endsWith('@resend.dev');
+
+  const domainStatus = await probeResendDomains(apiKey);
+  const fromDomain   = fromAddr.split('@')[1] || '';
+  const matchingDomain = (domainStatus.domains || []).find((d) => d.name === fromDomain);
+
+  const hints = [];
+  if (!apiKey) hints.push('Set RESEND_API_KEY in backend/.env and restart the server.');
+  if (sandbox) hints.push('MAIL_FROM is using the Resend sandbox sender — emails only deliver to the Resend account owner. Verify your domain and switch MAIL_FROM.');
+  if (apiKey && !sandbox && matchingDomain && matchingDomain.status !== 'verified') {
+    hints.push(`The "${fromDomain}" domain is "${matchingDomain.status}" on Resend — finish DNS verification before going live.`);
+  }
+  if (apiKey && !sandbox && !matchingDomain && !domainStatus.restricted) {
+    hints.push(`No matching domain "${fromDomain}" on this Resend account. Add and verify it.`);
+  }
+
+  const ready =
+    !!apiKey
+    && !sandbox
+    && (domainStatus.restricted || !!(matchingDomain && matchingDomain.status === 'verified'));
+
+  res.json({
+    ok:               true,
+    resend_configured: !!apiKey,
+    api_key_prefix:    apiKey ? `${apiKey.slice(0, 3)}…${apiKey.length} chars` : null,
+    mail_from:         from,
+    from_address:      fromAddr,
+    from_domain:       fromDomain,
+    sandbox,
+    domain_status:     domainStatus,
+    ready,
+    hints,
+  });
+});
+
+// POST /api/admin/mail-test  body: { to, subject? }
+// Sends a single test email and reports back what Resend said. Returns 200
+// regardless of outcome so the UI can render the diagnostic — only auth /
+// validation failures use non-200 status codes.
+app.post('/api/admin/mail-test', adminAuth, async (req, res) => {
+  const to      = String(req.body?.to || '').trim();
+  const subject = String(req.body?.subject || 'Gospelar mail health check').trim();
+  if (!isValidEmail(to)) {
+    return res.status(400).json({ ok: false, error: 'Invalid recipient email.' });
+  }
+  const stampedSubject = subject + ' · ' + new Date().toISOString();
+  const html = `
+    <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:24px;max-width:520px;margin:auto">
+      <h2 style="margin:0 0 12px;color:#1A56DB">✓ Gospelar mail health check</h2>
+      <p style="margin:0 0 10px;color:#0F172A;line-height:1.5">
+        If you're reading this, the Resend pipeline from <code>${process.env.MAIL_FROM || 'default sender'}</code>
+        is delivering correctly to <strong>${to}</strong>.
+      </p>
+      <p style="margin:0;color:#64748B;font-size:12.5px;line-height:1.5">
+        Sent at ${new Date().toLocaleString('en-NG')} from the admin dashboard mail-test endpoint.
+      </p>
+    </div>
+  `;
+  const result = await sendMail({ to, subject: stampedSubject, html });
+  res.json({
+    ok:        result.ok,
+    id:        result.id || null,
+    error:     result.error || null,
+    mail_from: process.env.MAIL_FROM || null,
+    to,
+    subject:   stampedSubject,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4631,6 +4772,108 @@ app.post('/api/admin/books/:id/entries', adminAuth, async (req, res) => {
     if (e.code === '23503') return res.status(404).json({ error: 'Book not found.' });
     console.error('POST /api/admin/books/:id/entries:', e.code, e.message);
     res.status(500).json({ error: 'Failed to upsert entry.' });
+  }
+});
+
+// POST /api/admin/books/:slug/seed — bulk upsert. Admin sends an array of
+// entries (and optional `meta` patch for the books row) and we run the same
+// INSERT … ON CONFLICT DO UPDATE used by the single-entry endpoint inside a
+// transaction, so a partial failure leaves the table unchanged. Replaces a
+// loop of 36 individual POSTs the admin would otherwise have to make to
+// import the bundled Victory Month content the first time.
+app.post('/api/admin/books/:slug/seed', adminAuth, async (req, res) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const { meta, entries } = req.body || {};
+  if (!slug)                  return res.status(400).json({ error: 'slug is required.' });
+  if (!Array.isArray(entries)) return res.status(400).json({ error: 'entries[] is required.' });
+
+  const client = await db.connect ? await db.connect() : null;
+  // Some db wrappers expose .connect() (pg.Pool) and some only .query() (lite
+  // wrappers). Fall back to non-transactional mode when no client is available
+  // — the upserts are still idempotent per row, so the worst case is a partial
+  // success the admin can retry.
+  const q = client ? client.query.bind(client) : db.query.bind(db);
+
+  try {
+    if (client) await q('BEGIN');
+
+    const bookResult = await q(
+      `SELECT id FROM books WHERE slug = $1`,
+      [slug]
+    );
+    if (!bookResult.rows.length) {
+      if (client) await q('ROLLBACK');
+      return res.status(404).json({ error: 'Book not found. Create it first.' });
+    }
+    const bookId = bookResult.rows[0].id;
+
+    if (meta && typeof meta === 'object') {
+      const allowed = [
+        'title', 'subtitle', 'description', 'cover_image_url', 'cover_emoji',
+        'accent_color', 'route_screen', 'available', 'sort_order', 'language',
+      ];
+      const sets = ['updated_at = NOW()'];
+      const params = [];
+      for (const k of allowed) {
+        if (Object.prototype.hasOwnProperty.call(meta, k)) {
+          params.push(meta[k]);
+          sets.push(`${k} = $${params.length}`);
+        }
+      }
+      if (params.length) {
+        params.push(bookId);
+        await q(`UPDATE books SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+      }
+    }
+
+    let upserted = 0;
+    for (const e of entries) {
+      if (!Number.isFinite(parseInt(e.entry_number, 10))) continue;
+      await q(`
+        INSERT INTO book_entries (
+          book_id, entry_number, entry_type, entry_date,
+          focus, scripture_text, inspirational_message,
+          prayer_points, special_intercession, hymn,
+          discussion_questions, declarations, sort_order
+        )
+        VALUES ($1, $2, $3, $4::date, $5, $6, $7, $8::jsonb, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13)
+        ON CONFLICT (book_id, entry_number, entry_type) DO UPDATE SET
+          entry_date            = EXCLUDED.entry_date,
+          focus                 = EXCLUDED.focus,
+          scripture_text        = EXCLUDED.scripture_text,
+          inspirational_message = EXCLUDED.inspirational_message,
+          prayer_points         = EXCLUDED.prayer_points,
+          special_intercession  = EXCLUDED.special_intercession,
+          hymn                  = EXCLUDED.hymn,
+          discussion_questions  = EXCLUDED.discussion_questions,
+          declarations          = EXCLUDED.declarations,
+          sort_order            = EXCLUDED.sort_order
+      `, [
+        bookId,
+        parseInt(e.entry_number, 10),
+        String(e.entry_type || 'daily'),
+        e.entry_date || null,
+        e.focus || null,
+        e.scripture_text || null,
+        e.inspirational_message || null,
+        JSON.stringify(e.prayer_points || []),
+        e.special_intercession || null,
+        e.hymn ? JSON.stringify(e.hymn) : null,
+        e.discussion_questions ? JSON.stringify(e.discussion_questions) : null,
+        e.declarations ? JSON.stringify(e.declarations) : null,
+        Number.isFinite(parseInt(e.sort_order, 10)) ? parseInt(e.sort_order, 10) : 100,
+      ]);
+      upserted++;
+    }
+
+    if (client) await q('COMMIT');
+    res.json({ ok: true, slug, book_id: bookId, upserted, received: entries.length });
+  } catch (e) {
+    if (client) { try { await q('ROLLBACK'); } catch {} }
+    console.error('POST /api/admin/books/:slug/seed:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to seed entries.' });
+  } finally {
+    if (client?.release) try { client.release(); } catch {}
   }
 });
 

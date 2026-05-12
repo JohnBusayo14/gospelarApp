@@ -20,7 +20,7 @@ function getConfig() {
     // Override via MAIL_FROM env var (e.g. set MAIL_FROM=onboarding@resend.dev
     // while you're still waiting on DNS verification — that sandbox sender
     // works without any DNS setup but only mails the Resend account owner).
-    from:   process.env.MAIL_FROM      || 'GOFAMINT Sunday School <noreply@gospelar.com>',
+    from:   process.env.MAIL_FROM      || 'Gospelar Sunday School <noreply@gospelar.com>',
   };
 }
 
@@ -95,7 +95,7 @@ function htmlToText(html) {
 // CHURCH APPROVAL TEMPLATES
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BRAND      = 'GOFAMINT Sunday School';
+const BRAND      = 'Gospelar Sunday School';
 const PRIMARY    = '#2563EB';
 const PRIMARY_BG = '#EFF6FF';
 const TEXT_DARK  = '#0F172A';
