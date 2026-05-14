@@ -1147,6 +1147,93 @@ app.post('/api/admin/churches', adminAuth, async (req, res) => {
   }
 });
 
+// Super-admin updates a church. Body may contain any of: name, location,
+// admin_email. Unspecified fields are left untouched. admin_token and
+// invite_code are intentionally NOT editable here — rotating those is a
+// separate operation that should invalidate active sessions.
+app.put('/api/admin/churches/:id', adminAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid church id.' });
+  const { name, location, admin_email } = req.body || {};
+  if (admin_email && !isValidEmail(admin_email)) {
+    return res.status(400).json({ error: 'Invalid admin_email.' });
+  }
+  // Build the SET clause from whichever fields were provided. This keeps the
+  // endpoint flexible — admins can rename a church without re-supplying the
+  // email, and vice versa.
+  const sets = [];
+  const params = [];
+  if (typeof name === 'string') {
+    const v = name.trim();
+    if (!v) return res.status(400).json({ error: 'name cannot be empty.' });
+    params.push(v); sets.push(`name = $${params.length}`);
+  }
+  if (typeof location === 'string') {
+    params.push(location.trim() || null); sets.push(`location = $${params.length}`);
+  }
+  if (typeof admin_email === 'string') {
+    params.push(admin_email.trim().toLowerCase()); sets.push(`admin_email = $${params.length}`);
+  }
+  if (sets.length === 0) return res.status(400).json({ error: 'No editable fields supplied.' });
+  params.push(id);
+  try {
+    const r = await db.query(
+      `UPDATE churches SET ${sets.join(', ')} WHERE id = $${params.length}
+       RETURNING id, name, location, admin_email, invite_code, created_at,
+                 COALESCE(approval_status, 'approved') AS approval_status`,
+      params,
+    );
+    if (r.rowCount === 0) return res.status(404).json({ error: 'Church not found.' });
+    res.json(r.rows[0]);
+  } catch (e) {
+    console.error('PUT /api/admin/churches/:id:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to update church.' });
+  }
+});
+
+// Super-admin deletes a church. Cascade rules on dependent tables (classes,
+// students, attendance, marks, etc.) clean up automatically — but
+// users.church_id is ON DELETE SET NULL, so teachers survive as "orphans"
+// that can later be reassigned via /api/admin/teachers.
+//
+// This is destructive — pass ?confirm=1 (or set body.confirm=true) to actually
+// delete. Without it the endpoint returns a preview of what would be removed
+// so the UI can show a meaningful confirmation dialog.
+app.delete('/api/admin/churches/:id', adminAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid church id.' });
+  const confirmed = req.query.confirm === '1' || req.body?.confirm === true;
+  try {
+    const church = await db.query(
+      `SELECT id, name, location, admin_email FROM churches WHERE id = $1`, [id],
+    );
+    if (church.rowCount === 0) return res.status(404).json({ error: 'Church not found.' });
+
+    // Count dependents up front so the UI can warn before the actual delete.
+    // Each query is small and only runs once per delete request — fine inline.
+    const [{ rows: t }, { rows: cl }, { rows: st }] = await Promise.all([
+      db.query(`SELECT COUNT(*)::int AS n FROM users   WHERE church_id = $1 AND role = 'teacher'`, [id]),
+      db.query(`SELECT COUNT(*)::int AS n FROM classes WHERE church_id = $1`, [id]),
+      db.query(`SELECT COUNT(*)::int AS n FROM students WHERE church_id = $1`, [id]).catch(() => ({ rows: [{ n: 0 }] })),
+    ]);
+    const preview = {
+      church:   church.rows[0],
+      teachers: t[0].n,   // will be orphaned (church_id set to NULL)
+      classes:  cl[0].n,  // will be cascade-deleted
+      students: st[0].n,  // will be cascade-deleted
+    };
+    if (!confirmed) {
+      return res.json({ ok: false, preview, message: 'Pass ?confirm=1 to actually delete.' });
+    }
+
+    await db.query('DELETE FROM churches WHERE id = $1', [id]);
+    res.json({ ok: true, deleted: preview });
+  } catch (e) {
+    console.error('DELETE /api/admin/churches/:id:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to delete church.' });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CHURCH ADMIN SELF-SERVICE SIGNUP / LOGIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5375,10 +5462,15 @@ app.get('/api/admin/insights/mark-distribution', churchAuth, async (req, res) =>
 app.get('/api/progress/:email', async (req, res) => {
   const email = decodeURIComponent(req.params.email);
   try {
+    // `score` in user_scores is the sum of points earned (e.g., 4 correct × 10
+    // pts = 40), NOT the count of correct answers. To compute percent we
+    // therefore have to divide by the sum of question points, not the count
+    // of questions. max_possible_score does that.
     const scores = await db.query(`
       SELECT us.lesson_id, us.score AS last_score, COALESCE(us.max_score,us.score) AS best_score,
              us.completed_at, l.lesson_number, l.title, l.topic, l.category_id,
-             (SELECT COUNT(*) FROM lesson_quizzes WHERE lesson_id=us.lesson_id)::int AS total_questions
+             (SELECT COUNT(*) FROM lesson_quizzes WHERE lesson_id=us.lesson_id)::int AS total_questions,
+             (SELECT COALESCE(SUM(points), 0) FROM lesson_quizzes WHERE lesson_id=us.lesson_id)::int AS max_possible_score
       FROM user_scores us JOIN lessons l ON l.id=us.lesson_id
       WHERE us.email=$1 ORDER BY l.lesson_number
     `, [email]);
@@ -5396,13 +5488,21 @@ app.get('/api/progress/:email', async (req, res) => {
       completedCount:rows.length, totalLessons:parseInt(totalLessons.rows[0].count,10),
       totalPoints:totalBest,
       rank:rankR.rows[0]?parseInt(rankR.rows[0].rank,10):null,
-      lessons:rows.map(r=>({
-        lessonId:r.lesson_id, lessonNumber:r.lesson_number, title:r.title, topic:r.topic,
-        categoryId:r.category_id, lastScore:parseInt(r.last_score,10), bestScore:parseInt(r.best_score,10),
-        totalQuestions:r.total_questions,
-        percent:r.total_questions>0?Math.round((parseInt(r.best_score,10)/r.total_questions)*100):0,
-        completedAt:r.completed_at,
-      })),
+      lessons:rows.map(r=>{
+        const best = parseInt(r.best_score, 10) || 0;
+        const max  = parseInt(r.max_possible_score, 10) || 0;
+        // Cap at 100 — if a question gets removed after submission, best can
+        // exceed the new max and we don't want to surface > 100% in the UI.
+        const pct  = max > 0 ? Math.min(100, Math.round((best / max) * 100)) : 0;
+        return {
+          lessonId:r.lesson_id, lessonNumber:r.lesson_number, title:r.title, topic:r.topic,
+          categoryId:r.category_id, lastScore:parseInt(r.last_score,10), bestScore:best,
+          totalQuestions:r.total_questions,
+          maxPossibleScore:max,
+          percent:pct,
+          completedAt:r.completed_at,
+        };
+      }),
     });
   } catch (e) { res.status(500).json({ error:'Failed to fetch progress.' }); }
 });
