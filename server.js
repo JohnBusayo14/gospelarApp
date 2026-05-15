@@ -44,6 +44,8 @@ app.use(require('./routes/quarterInfo'));
 app.use(require('./routes/teacher'));
 app.use(require('./routes/books'));
 app.use(require('./routes/notifications'));
+app.use(require('./routes/gospelerIds'));
+app.use(require('./routes/membership'));
 
 const social = require('./routes/social');
 app.use(social);

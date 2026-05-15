@@ -913,6 +913,21 @@ const initDb = async () => {
      )`,
     `CREATE INDEX IF NOT EXISTS idx_gospeler_verify_code
        ON gospeler_verification_logs(gospeler_code, scanned_at DESC)`,
+
+    // ── Gospeler ID — extended membership fields ────────────────────────────
+    // Mirrors the registration webapp's attendee profile so the same person
+    // identifies the same way across mobile + web. Adopted from the GOFAMINT
+    // records taxonomy — `church_status` is the 28-code STATUSES enum, with
+    // (region, district, assembly) replacing the looser (church_name, church_branch)
+    // pair for users registered through the denomination's hierarchy. The
+    // older columns remain so legacy rows aren't disturbed.
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS title          VARCHAR(40)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS church_status  VARCHAR(20)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS age_bracket    VARCHAR(40)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS city           VARCHAR(120)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS region         VARCHAR(120)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS district       VARCHAR(120)`,
+    `ALTER TABLE gospeler_ids ADD COLUMN IF NOT EXISTS assembly       VARCHAR(200)`,
   ];
 
   for (const sql of steps) {
