@@ -34,6 +34,113 @@ function ticketPayload(ticket, extra = {}) {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Ticket-flow endpoints (called by the registration frontend)
+// The backend doesn't yet own the events/tickets tables — the frontend hands
+// over a self-contained `ticket` object so we can dispatch without a lookup.
+// When the events tables ship, swap `req.body.ticket` for a DB read.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Format an ISO date for the email body. Falls back gracefully on bad input.
+function fmtEventStart(iso) {
+  if (!iso) return null;
+  try { return new Date(iso).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }); }
+  catch { return null; }
+}
+
+// POST /api/notifications/email-ticket  body: { to, ticket }
+router.post('/api/notifications/email-ticket', async (req, res) => {
+  const to     = String(req.body?.to || '').trim();
+  const ticket = req.body?.ticket || {};
+  if (!isValidEmail(to))   return res.status(400).json({ ok: false, error: 'Invalid recipient email.' });
+  if (!ticket.code)        return res.status(400).json({ ok: false, error: 'ticket.code is required.' });
+
+  const r = await sendNow({
+    kind: 'ticket.confirmation',
+    channel: 'email',
+    recipient: to,
+    payload: ticketPayload(ticket),
+    dedupeKey: `email:ticket.confirmation:${ticket.code}`,
+    metadata: { ticketCode: ticket.code, eventId: ticket.eventId || null },
+  });
+  res.json({ ok: r.ok, id: r.id || null, error: r.error || null, dedupeHit: r.dedupeHit || false });
+});
+
+// POST /api/notifications/sms-ticket  body: { to, ticket }
+router.post('/api/notifications/sms-ticket', async (req, res) => {
+  const to     = String(req.body?.to || '').trim();
+  const ticket = req.body?.ticket || {};
+  if (!normalizePhone(to)) return res.status(400).json({ ok: false, error: 'Invalid recipient phone.' });
+  if (!ticket.code)        return res.status(400).json({ ok: false, error: 'ticket.code is required.' });
+
+  const r = await sendNow({
+    kind: 'ticket.confirmation',
+    channel: 'sms',
+    recipient: to,
+    payload: ticketPayload(ticket),
+    dedupeKey: `sms:ticket.confirmation:${ticket.code}`,
+    metadata: { ticketCode: ticket.code, eventId: ticket.eventId || null },
+  });
+  res.json({ ok: r.ok, id: r.id || null, error: r.error || null, dedupeHit: r.dedupeHit || false });
+});
+
+// POST /api/notifications/schedule-reminder
+// body: { ticket, sendAt, kind?, channels? }
+// kind defaults to 'event.reminder'. channels defaults to ['email'].
+router.post('/api/notifications/schedule-reminder', async (req, res) => {
+  const ticket   = req.body?.ticket || {};
+  const sendAt   = req.body?.sendAt;
+  const kind     = String(req.body?.kind || 'event.reminder');
+  const channels = Array.isArray(req.body?.channels) && req.body.channels.length
+    ? req.body.channels.map((c) => String(c).toLowerCase()).filter((c) => ['email', 'sms'].includes(c))
+    : ['email'];
+
+  if (!ticket.code)            return res.status(400).json({ ok: false, error: 'ticket.code is required.' });
+  if (!sendAt)                 return res.status(400).json({ ok: false, error: 'sendAt (ISO) is required.' });
+  const when = new Date(sendAt);
+  if (Number.isNaN(when.getTime())) return res.status(400).json({ ok: false, error: 'sendAt is not a valid date.' });
+
+  const out = [];
+  for (const channel of channels) {
+    const recipient = channel === 'email' ? ticket.attendeeEmail : ticket.attendeePhone;
+    if (!recipient) { out.push({ channel, ok: false, error: 'No recipient on ticket.' }); continue; }
+    const r = await schedule({
+      kind, channel, recipient,
+      payload: ticketPayload(ticket, {
+        whenLabel:     req.body?.whenLabel     || null,
+        eventStartsAt: fmtEventStart(ticket.eventStartsAt),
+      }),
+      runAt: when,
+      dedupeKey: `${channel}:${kind}:${ticket.code}`,
+    });
+    out.push({ channel, ok: r.ok, id: r.id || null, error: r.error || null });
+  }
+  res.json({ ok: out.every((x) => x.ok), scheduled: out });
+});
+
+// POST /api/admin/notifications/announce
+// body: { eventId?, subject, message, recipients, channels? }
+// Thin alias over /broadcast that takes a human-shaped `message` field.
+router.post('/api/admin/notifications/announce', adminAuth, async (req, res) => {
+  const subject    = req.body?.subject || null;
+  const body       = req.body?.message || req.body?.body || '';
+  const channels   = Array.isArray(req.body?.channels) && req.body.channels.length
+    ? req.body.channels.map((c) => String(c).toLowerCase()).filter((c) => ['email', 'sms'].includes(c))
+    : ['email', 'sms'];
+  const recipients = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
+
+  if (!body && !subject) return res.status(400).json({ error: 'Provide at least subject or message.' });
+  if (!recipients.length) return res.status(400).json({ error: 'recipients[] is required.' });
+
+  const result = await broadcast({
+    kind: 'announcement',
+    recipients,
+    payload: { subject, body, eventId: req.body?.eventId || null },
+    channels,
+  });
+  res.json(result);
+});
+
 // User opt-in/out. SMS defaults off, reminders defaults on. Phone is
 // validated (must normalise) but stored unchanged so the user sees what
 // they typed when they come back. Sending always goes through normalize-

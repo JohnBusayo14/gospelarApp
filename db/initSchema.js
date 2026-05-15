@@ -857,6 +857,62 @@ const initDb = async () => {
     `CREATE INDEX IF NOT EXISTS idx_notif_sched_due
        ON notification_schedule(run_at)
        WHERE dispatched_at IS NULL`,
+
+    // ── Gospeler ID — per-user digital Christian identity ─────────────────────
+    // One active row per email. When important fields change (church, branch,
+    // legal name, role) the route handler archives the current row into
+    // gospeler_id_history with version+1 and writes a new gospeler_code so the
+    // QR/scan history of the previous identity stays intact and auditable.
+    `CREATE TABLE IF NOT EXISTS gospeler_ids (
+       id              TEXT         PRIMARY KEY,
+       email           VARCHAR(255) NOT NULL UNIQUE,
+       gospeler_code   VARCHAR(60)  NOT NULL UNIQUE,
+       version         INT          NOT NULL DEFAULT 1,
+       full_name       VARCHAR(160) NOT NULL,
+       phone           VARCHAR(40),
+       church_name     VARCHAR(200),
+       church_branch   VARCHAR(200),
+       country         VARCHAR(80),
+       state_province  VARCHAR(80),
+       gender          VARCHAR(20),
+       date_of_birth   DATE,
+       photo_base64    TEXT,
+       membership_role VARCHAR(40)  DEFAULT 'member',
+       verified        BOOLEAN      DEFAULT FALSE,
+       issued_at       TIMESTAMPTZ  DEFAULT NOW(),
+       updated_at      TIMESTAMPTZ  DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gospeler_ids_code ON gospeler_ids(gospeler_code)`,
+
+    // Retired Gospeler IDs. `snapshot` is the full row at the time of
+    // retirement so an admin can reconstruct the historical card exactly even
+    // if photo/name/role changed later.
+    `CREATE TABLE IF NOT EXISTS gospeler_id_history (
+       id              BIGSERIAL    PRIMARY KEY,
+       email           VARCHAR(255) NOT NULL,
+       gospeler_code   VARCHAR(60)  NOT NULL,
+       version         INT          NOT NULL,
+       snapshot        JSONB        NOT NULL,
+       reason          VARCHAR(120),
+       retired_at      TIMESTAMPTZ  DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gospeler_history_email
+       ON gospeler_id_history(email, version DESC)`,
+
+    // QR-scan / verification audit. Anyone can POST a verify call (church
+    // attendance scanner, event check-in) and we log the result + context so
+    // the user (and church admin) can later see where their ID has been used.
+    `CREATE TABLE IF NOT EXISTS gospeler_verification_logs (
+       id              BIGSERIAL    PRIMARY KEY,
+       gospeler_code   VARCHAR(60)  NOT NULL,
+       scanned_by      VARCHAR(255),
+       scan_context    VARCHAR(40),
+       result          VARCHAR(20)  NOT NULL,
+       metadata        JSONB,
+       scanned_at      TIMESTAMPTZ  DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_gospeler_verify_code
+       ON gospeler_verification_logs(gospeler_code, scanned_at DESC)`,
   ];
 
   for (const sql of steps) {
