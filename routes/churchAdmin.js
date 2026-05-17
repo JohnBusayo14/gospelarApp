@@ -183,6 +183,24 @@ router.post('/api/admin/church-applications/:id/approve', adminAuth, async (req,
     if (!r.rows.length) return res.status(404).json({ error: 'Application not found.' });
     const church = r.rows[0];
 
+    // Guarantee a 'pastor' staff row exists for the church admin so the
+    // dashboard sees the full-access role on the first /me call. The schema
+    // auto-seed only runs at bootstrap; this makes per-approval explicit.
+    // ON CONFLICT (church_id, email) DO NOTHING keeps the call idempotent
+    // if the row already exists (e.g. on a re-approval).
+    try {
+      await db.query(
+        `INSERT INTO staff (church_id, email, name, role, status)
+         VALUES ($1, LOWER($2), COALESCE($3, $2), 'pastor', 'active')
+         ON CONFLICT (church_id, email) DO NOTHING`,
+        [church.id, church.admin_email, church.contact_name || null],
+      );
+    } catch (e) {
+      // Don't roll back the approval if the staff seed fails — middleware's
+      // 'pastor' fallback still covers the dashboard. Just log and continue.
+      console.warn('[approve] staff seed failed for church', church.id, '·', e.message);
+    }
+
     // Approval has already committed; email failure is a soft warning, not a rollback.
     let mail;
     try {
