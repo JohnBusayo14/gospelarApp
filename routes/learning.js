@@ -250,6 +250,34 @@ router.get('/api/church-admin/certificates/:id', churchAuth, async (req, res) =>
   }
 });
 
+// Public verification endpoint — no auth, no church scope. Returns the
+// minimum a third party needs to verify a shared certificate (title, name,
+// issuer label, dates, church) and explicitly hides the recipient's email.
+// Revoked certificates are still resolvable so the consumer can see the
+// "revoked" stamp; non-existent codes return 404.
+router.get('/api/certificates/verify/:certificate_no', async (req, res) => {
+  const code = String(req.params.certificate_no || '').trim();
+  if (!code) return res.status(400).json({ error: 'certificate_no is required.' });
+  try {
+    const r = await db.query(
+      `SELECT c.certificate_no, c.type, c.title, c.body, c.context,
+              c.student_name, c.awarded_by, c.awarded_at, c.revoked_at,
+              ch.name AS church_name, b.name AS branch_name
+         FROM certificates c
+         JOIN churches ch ON ch.id = c.church_id
+         LEFT JOIN branches b ON b.id = c.branch_id
+        WHERE c.certificate_no = $1
+        LIMIT 1`,
+      [code],
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Certificate not found.' });
+    res.json({ certificate: r.rows[0] });
+  } catch (e) {
+    console.error('GET /api/certificates/verify/:certificate_no:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load certificate.' });
+  }
+});
+
 router.post('/api/church-admin/certificates', churchAuth, async (req, res) => {
   if (!req.church) return res.status(400).json({ error: 'super-admin call — no church scope' });
   const {
@@ -264,6 +292,12 @@ router.post('/api/church-admin/certificates', churchAuth, async (req, res) => {
   if (!title?.trim())
     return res.status(400).json({ error: 'title is required.' });
   try {
+    // Prefer the issuer's display name so the printed/shared certificate
+    // reads naturally ("Pastor Olu") instead of leaking an email address.
+    // Falls back to email if the staff row has no name set yet.
+    const awardedByLabel = (req.staff?.name && req.staff.name.trim())
+      || req.staff?.email
+      || null;
     const r = await db.query(
       `INSERT INTO certificates
          (church_id, branch_id, student_email, student_name, type, title, body,
@@ -276,7 +310,7 @@ router.post('/api/church-admin/certificates', churchAuth, async (req, res) => {
         type, title.trim(), body || null,
         context ? JSON.stringify(context) : null,
         makeCertNo(),
-        req.staff?.email || null, awarded_at || null,
+        awardedByLabel, awarded_at || null,
       ],
     );
     logActivity({
