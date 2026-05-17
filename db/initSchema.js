@@ -958,10 +958,17 @@ const initDb = async () => {
        banner_url             TEXT,
        schedule               JSONB,
        status                 TEXT         NOT NULL DEFAULT 'published',
+       creator_email          TEXT,
+       requires_login         BOOLEAN      NOT NULL DEFAULT FALSE,
        created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
        updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
      )`,
+    // ALTER versions for already-deployed databases — IF NOT EXISTS is a
+    // PG 9.6+ feature so this is safe to run on every boot.
+    `ALTER TABLE events ADD COLUMN IF NOT EXISTS creator_email  TEXT`,
+    `ALTER TABLE events ADD COLUMN IF NOT EXISTS requires_login BOOLEAN NOT NULL DEFAULT FALSE`,
     `CREATE INDEX IF NOT EXISTS idx_events_status_starts ON events(status, starts_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_events_creator       ON events(creator_email)`,
 
     // One row per ticket tier inside an event. (event_id, type_id) is the PK
     // so the admin form's "Standard", "Student", "Staff" stay stable across

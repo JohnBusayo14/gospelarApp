@@ -19,7 +19,7 @@
 
 const express = require('express');
 const db = require('../db');
-const { adminAuth }    = require('../middleware/auth');
+const { adminAuth, userAuth } = require('../middleware/auth');
 const { isValidEmail } = require('../utils/helpers');
 
 const router = express.Router();
@@ -44,6 +44,8 @@ function eventRow(row, types = [], accommodation = []) {
     bannerUrl:             row.banner_url || '',
     schedule:              row.schedule || [],
     status:                row.status || 'published',
+    creatorEmail:          row.creator_email || null,
+    requiresLogin:         !!row.requires_login,
     ticketTypes:           types,
     accommodation:         accommodation,
     createdAt:             row.created_at,
@@ -184,8 +186,9 @@ async function upsertEvent(ev) {
   const ins = await db.query(
     `INSERT INTO events
        (id, church_id, title, tagline, summary, starts_at, ends_at,
-        registration_deadline, location, cover_color, banner_url, schedule, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
+        registration_deadline, location, cover_color, banner_url, schedule,
+        status, creator_email, requires_login)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15)
      ON CONFLICT (id) DO UPDATE SET
        church_id             = EXCLUDED.church_id,
        title                 = EXCLUDED.title,
@@ -199,6 +202,9 @@ async function upsertEvent(ev) {
        banner_url            = EXCLUDED.banner_url,
        schedule              = EXCLUDED.schedule,
        status                = EXCLUDED.status,
+       requires_login        = EXCLUDED.requires_login,
+       -- creator_email is set once on insert; later edits don't reassign it
+       -- so a super-admin editing the event doesn't steal ownership.
        updated_at            = NOW()
      RETURNING *`,
     [
@@ -207,6 +213,8 @@ async function upsertEvent(ev) {
       ev.location || '', ev.coverColor || '', ev.bannerUrl || '',
       JSON.stringify(ev.schedule || []),
       ev.status || 'published',
+      ev.creatorEmail || null,
+      !!ev.requiresLogin,
     ],
   );
   const eventId = ins.rows[0].id;
@@ -275,6 +283,100 @@ router.post('/api/admin/events', adminAuth, async (req, res) => {
   } catch (e) {
     console.error('POST /api/admin/events:', e.code, e.message);
     res.status(500).json({ error: 'Failed to save event.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User-facing write paths — any signed-in user can create/edit their OWN
+// events (Google-Form-style). Super admins can edit anyone's event via the
+// existing /api/admin/events/* routes; normal users are scoped to events
+// where creator_email = their email.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/events — create. Stamps creator_email from the session and
+// rejects payloads that try to override it. The frontend slugifies a title
+// into an id, which we use as the primary key (matches the localStorage
+// shim and existing admin form).
+router.post('/api/events', userAuth, async (req, res) => {
+  const ev = req.body || {};
+  if (!ev.id || !ev.title) return res.status(400).json({ error: 'id and title are required.' });
+
+  // Forbid duplicate slugs across creators — first-come wins, the second
+  // user is told to pick a different title.
+  try {
+    const dup = await db.query(`SELECT creator_email FROM events WHERE id = $1`, [ev.id]);
+    if (dup.rows.length) {
+      return res.status(409).json({ error: 'An event with that id/slug already exists. Try a different title.' });
+    }
+    const saved = await upsertEvent({ ...ev, creatorEmail: req.user.email });
+    res.json(saved);
+  } catch (e) {
+    console.error('POST /api/events:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to create event.' });
+  }
+});
+
+// PUT /api/events/:id — update. Allowed when the authenticated user is the
+// event's original creator OR has role='admin'. Other users get 403.
+router.put('/api/events/:id', userAuth, async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) return res.status(400).json({ error: 'Event id is required.' });
+  try {
+    const own = await db.query(`SELECT creator_email FROM events WHERE id = $1`, [id]);
+    if (!own.rows.length) return res.status(404).json({ error: 'Event not found.' });
+    const creator = String(own.rows[0].creator_email || '').toLowerCase();
+    const isAdmin = req.user.role === 'admin';
+    if (!isAdmin && creator !== String(req.user.email).toLowerCase()) {
+      return res.status(403).json({ error: 'Only the event creator (or a super-admin) can edit this event.' });
+    }
+    const ev = { ...req.body, id };
+    if (!ev.title) return res.status(400).json({ error: 'title is required.' });
+    res.json(await upsertEvent(ev));
+  } catch (e) {
+    console.error('PUT /api/events/:id:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to save event.' });
+  }
+});
+
+// DELETE /api/events/:id — same ownership rule as PUT.
+router.delete('/api/events/:id', userAuth, async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  try {
+    const own = await db.query(`SELECT creator_email FROM events WHERE id = $1`, [id]);
+    if (!own.rows.length) return res.status(404).json({ error: 'Event not found.' });
+    const creator = String(own.rows[0].creator_email || '').toLowerCase();
+    const isAdmin = req.user.role === 'admin';
+    if (!isAdmin && creator !== String(req.user.email).toLowerCase()) {
+      return res.status(403).json({ error: 'Only the event creator (or a super-admin) can delete this event.' });
+    }
+    const r = await db.query(`DELETE FROM events WHERE id = $1`, [id]);
+    res.json({ ok: r.rowCount > 0 });
+  } catch (e) {
+    console.error('DELETE /api/events/:id:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to delete event.' });
+  }
+});
+
+// GET /api/me/events — the signed-in user's own events. Used by the
+// "My events" panel on the user's dashboard.
+router.get('/api/me/events', userAuth, async (req, res) => {
+  try {
+    const list = await db.query(
+      `SELECT * FROM events WHERE LOWER(creator_email) = LOWER($1) ORDER BY created_at DESC`,
+      [req.user.email],
+    );
+    if (!list.rows.length) return res.json([]);
+    const ids = list.rows.map((r) => r.id);
+    const [tt, acc] = await Promise.all([
+      db.query(`SELECT * FROM event_ticket_types  WHERE event_id = ANY($1::text[]) ORDER BY sort_order, name`, [ids]),
+      db.query(`SELECT * FROM event_accommodation WHERE event_id = ANY($1::text[]) ORDER BY sort_order, name`, [ids]),
+    ]);
+    const tByEvent = new Map(); for (const r of tt.rows)  { (tByEvent.get(r.event_id) || tByEvent.set(r.event_id, []).get(r.event_id)).push(ticketTypeRow(r)); }
+    const aByEvent = new Map(); for (const r of acc.rows) { (aByEvent.get(r.event_id) || aByEvent.set(r.event_id, []).get(r.event_id)).push(accommodationRow(r)); }
+    res.json(list.rows.map((row) => eventRow(row, tByEvent.get(row.id) || [], aByEvent.get(row.id) || [])));
+  } catch (e) {
+    console.error('GET /api/me/events:', e.code, e.message);
+    res.status(500).json({ error: 'Failed to load your events.' });
   }
 });
 
@@ -355,6 +457,30 @@ router.post('/api/events/:id/register', async (req, res) => {
   if (!ticketTypeId) return res.status(400).json({ error: 'ticketTypeId is required.' });
   if (!attendees.length) return res.status(400).json({ error: 'At least one attendee is required.' });
   if (attendees.length > 50) return res.status(400).json({ error: 'Maximum 50 attendees per registration.' });
+
+  // requires_login gate — when the event creator marked the event as
+  // login-only, reject requests without a valid Bearer token. We check
+  // first (before opening a tx) so unauthenticated clients fail fast and
+  // don't tie up a connection. Frontend sees 401 + error code and bounces
+  // the user to /login?redirect=/r/:id.
+  try {
+    const gate = await db.query(`SELECT requires_login FROM events WHERE id = $1`, [eventId]);
+    if (!gate.rows.length) return res.status(404).json({ error: 'Event not found.' });
+    if (gate.rows[0].requires_login) {
+      const hdr = String(req.headers.authorization || '');
+      const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
+      if (!bearer) {
+        return res.status(401).json({ error: 'login_required', message: 'Sign in to register for this event.' });
+      }
+      const sess = await db.query(`SELECT email FROM users WHERE session_token = $1`, [bearer]);
+      if (!sess.rows.length) {
+        return res.status(401).json({ error: 'login_required', message: 'Your sign-in session has expired. Sign in again.' });
+      }
+    }
+  } catch (e) {
+    console.error('register requires_login gate:', e.code, e.message);
+    return res.status(500).json({ error: 'Could not check registration access.' });
+  }
 
   const client = await txPool.connect();
   try {

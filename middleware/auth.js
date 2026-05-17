@@ -112,8 +112,53 @@ const requirePerm = (resource, level) => (req, res, next) => {
   next();
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Session-token user auth — for the registration site's signed-in surfaces
+// (POST /api/events by any authenticated user, etc.). Bearer token must match
+// users.session_token. On success attaches `req.user = { id, email, role,
+// full_name }`. Used alongside (not instead of) adminAuth for super-admin only
+// routes, because super-admin is "logged-in user with role='admin'", not the
+// shared x-admin-key.
+// ─────────────────────────────────────────────────────────────────────────────
+const userAuth = async (req, res, next) => {
+  const hdr = String(req.headers.authorization || '');
+  const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
+  if (!bearer) return res.status(401).json({ error: 'Missing Bearer token.' });
+  try {
+    const r = await db.query(
+      `SELECT id, email, full_name, role, session_token, session_at
+         FROM users WHERE session_token = $1`,
+      [bearer],
+    );
+    if (!r.rows.length) return res.status(401).json({ error: 'Invalid session.' });
+    const u = r.rows[0];
+    req.user = {
+      id: u.id,
+      email: u.email,
+      full_name: u.full_name || '',
+      role: u.role || 'student',
+    };
+    next();
+  } catch (e) {
+    console.error('userAuth:', e.message);
+    res.status(500).json({ error: 'Auth check failed.' });
+  }
+};
+
+// Wraps userAuth — only succeeds when the authenticated user has role='admin'.
+// Use for routes that the registration site's super-admin-only menu items hit
+// (e.g. admin event editing, churches listing).
+const superAdminAuth = (req, res, next) => userAuth(req, res, (err) => {
+  if (err) return next(err);
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Super-admin only.' });
+  }
+  next();
+});
+
 module.exports = {
   adminAuth, churchAuth, requirePerm,
+  userAuth, superAdminAuth,
   churchScope, branchScope,
   ROLE_PERMS,
 };
