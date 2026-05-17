@@ -1037,6 +1037,17 @@ const initDb = async () => {
     `CREATE INDEX IF NOT EXISTS idx_event_tickets_event ON event_tickets(event_id, purchased_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_event_tickets_email ON event_tickets(LOWER(attendee_email)) WHERE attendee_email IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_event_tickets_group ON event_tickets(group_id) WHERE group_id IS NOT NULL`,
+
+    // Who clicked "Register" — stamped from the bearer session when the
+    // registrant is signed in. Lets the Tickets page surface every ticket
+    // they bought even when the attendee_email differs (e.g. registering a
+    // spouse, a child, or a group member under their own account).
+    `ALTER TABLE event_tickets ADD COLUMN IF NOT EXISTS registered_by_user_id TEXT`,
+    `ALTER TABLE event_tickets ADD COLUMN IF NOT EXISTS registered_by_email   TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_event_tickets_registered_by_user
+       ON event_tickets(registered_by_user_id) WHERE registered_by_user_id IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_event_tickets_registered_by_email
+       ON event_tickets(LOWER(registered_by_email)) WHERE registered_by_email IS NOT NULL`,
   ];
 
   for (const sql of steps) {

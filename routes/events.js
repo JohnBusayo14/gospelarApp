@@ -21,6 +21,7 @@ const express = require('express');
 const db = require('../db');
 const { adminAuth, userAuth } = require('../middleware/auth');
 const { isValidEmail } = require('../utils/helpers');
+const { sendNow } = require('../services/notifications');
 
 const router = express.Router();
 
@@ -458,24 +459,33 @@ router.post('/api/events/:id/register', async (req, res) => {
   if (!attendees.length) return res.status(400).json({ error: 'At least one attendee is required.' });
   if (attendees.length > 50) return res.status(400).json({ error: 'Maximum 50 attendees per registration.' });
 
-  // requires_login gate — when the event creator marked the event as
-  // login-only, reject requests without a valid Bearer token. We check
-  // first (before opening a tx) so unauthenticated clients fail fast and
-  // don't tie up a connection. Frontend sees 401 + error code and bounces
-  // the user to /login?redirect=/r/:id.
+  // Soft-auth: resolve the caller from a Bearer token when present so we
+  // can stamp `registered_by_*` on each ticket and surface them on the
+  // Tickets page even when the attendee_email differs. The requires_login
+  // gate below piggybacks on this — when the event creator marked the
+  // event as login-only, we reject anon callers up front so they fail fast
+  // and don't tie up a tx connection. Frontend sees 401 + error code and
+  // bounces the user to /login?redirect=/r/:id.
+  let actor = null;
   try {
     const gate = await db.query(`SELECT requires_login FROM events WHERE id = $1`, [eventId]);
     if (!gate.rows.length) return res.status(404).json({ error: 'Event not found.' });
-    if (gate.rows[0].requires_login) {
-      const hdr = String(req.headers.authorization || '');
-      const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
-      if (!bearer) {
-        return res.status(401).json({ error: 'login_required', message: 'Sign in to register for this event.' });
-      }
-      const sess = await db.query(`SELECT email FROM users WHERE session_token = $1`, [bearer]);
-      if (!sess.rows.length) {
-        return res.status(401).json({ error: 'login_required', message: 'Your sign-in session has expired. Sign in again.' });
-      }
+    const hdr = String(req.headers.authorization || '');
+    const bearer = hdr.startsWith('Bearer ') ? hdr.slice(7).trim() : '';
+    if (bearer) {
+      const sess = await db.query(
+        `SELECT id, email FROM users WHERE session_token = $1`,
+        [bearer],
+      );
+      if (sess.rows.length) actor = { id: sess.rows[0].id, email: sess.rows[0].email };
+    }
+    if (gate.rows[0].requires_login && !actor) {
+      return res.status(401).json({
+        error: 'login_required',
+        message: bearer
+          ? 'Your sign-in session has expired. Sign in again.'
+          : 'Sign in to register for this event.',
+      });
     }
   } catch (e) {
     console.error('register requires_login gate:', e.code, e.message);
@@ -538,8 +548,9 @@ router.post('/api/events/:id/register', async (req, res) => {
                 group_id, group_type, group_name, group_lead_email,
                 attendee_name, attendee_email, attendee_phone, attendee_profile,
                 age_group, dietary, emergency_name, emergency_phone,
-                role, referrer, status, ticket_url)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20)
+                role, referrer, status, ticket_url,
+                registered_by_user_id, registered_by_email)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
              RETURNING *`,
             [
               code, eventId, ticketTypeId, accommodationId,
@@ -574,6 +585,8 @@ router.post('/api/events/:id/register', async (req, res) => {
               referrer,
               'confirmed',
               ticketUrlOrigin ? `${ticketUrlOrigin}/tickets/${code}` : `/tickets/${code}`,
+              actor?.id || null,
+              actor?.email ? actor.email.toLowerCase() : null,
             ],
           );
           tickets.push(row.rows[0]);
@@ -612,6 +625,45 @@ router.post('/api/events/:id/register', async (req, res) => {
       ticket_type_name: ticketTypeName,
       accommodation_name: accommodationName,
     }));
+
+    // Authoritative confirmation send — runs after the tx commits so we
+    // never email about a ticket that doesn't exist. The frontend also
+    // calls /api/notifications/email-ticket as a best-effort fallback;
+    // notification_log dedupes both paths via the same key shape used by
+    // that route (`ticket:<code>:email:confirmation:<recipient>`), so the
+    // attendee gets exactly one copy. Fire-and-forget — failures are
+    // logged to notification_log and don't block the response.
+    Promise.all(decorated.map((t) => {
+      const to = (t.attendeeEmail || '').toLowerCase();
+      if (!to) return null;
+      return sendNow({
+        kind:      'ticket.confirmation',
+        channel:   'email',
+        recipient: to,
+        payload: {
+          eventTitle:        t.eventTitle,
+          eventStartsAt:     t.eventStartsAt,
+          eventLocation:     t.eventLocation,
+          attendeeName:      t.attendeeName,
+          attendeeEmail:     t.attendeeEmail,
+          attendeePhone:     t.attendeePhone,
+          attendeePhoto:     t.attendeePhoto,
+          attendeeProfile:   t.attendeeProfile,
+          ticketCode:        t.code,
+          role:              t.role,
+          ticketUrl:         t.ticketUrl,
+          ticketTypeName:    t.ticketTypeName,
+          accommodationName: t.accommodationName,
+          roomLabel:         t.roomLabel,
+          seatLabel:         t.seatLabel,
+          groupName:         t.groupName,
+          groupType:         t.groupType,
+        },
+        dedupeKey: `ticket:${t.code}:email:confirmation:${to}`,
+        metadata:  { ticketCode: t.code, eventId: t.eventId, groupId: t.groupId || null, source: 'register-handler' },
+      }).catch((e) => console.warn('register confirm-email failed', t.code, e.message));
+    })).catch(() => {});
+
     res.json({ tickets: decorated, primaryCode: decorated[0]?.code || null, groupId });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
@@ -654,14 +706,30 @@ router.get('/api/tickets/:code', async (req, res) => {
   }
 });
 
-router.get('/api/tickets', async (req, res) => {
-  const email = String(req.query.email || '').trim().toLowerCase();
-  if (!email) return res.json([]); // no email = empty list; admin uses /api/events/:id/tickets
+// Returns every ticket the caller has any claim to: tickets where they
+// are the attendee (attendee_email match), tickets they bought for someone
+// else (registered_by_email or registered_by_user_id match), or — for
+// admins only — any ticket matched by the ?email= override (used by the
+// kiosk / staff lookup form on the Tickets page).
+router.get('/api/tickets', userAuth, async (req, res) => {
+  const isAdmin    = req.user.role === 'admin';
+  const override   = String(req.query.email || '').trim().toLowerCase();
+  const lookupEmail = (isAdmin && override) ? override : String(req.user.email || '').toLowerCase();
+  if (!lookupEmail) return res.json([]);
   try {
-    const r = await db.query(
-      `${TICKET_SELECT} WHERE LOWER(t.attendee_email) = $1 ORDER BY t.purchased_at DESC`,
-      [email],
-    );
+    // Admin override searches only attendee_email — staff are looking up
+    // someone else's tickets by email, not by who registered them.
+    const sql = (isAdmin && override)
+      ? `${TICKET_SELECT}
+           WHERE LOWER(t.attendee_email) = $1
+           ORDER BY t.purchased_at DESC`
+      : `${TICKET_SELECT}
+           WHERE LOWER(t.attendee_email)      = $1
+              OR LOWER(t.registered_by_email) = $1
+              OR t.registered_by_user_id      = $2
+           ORDER BY t.purchased_at DESC`;
+    const params = (isAdmin && override) ? [lookupEmail] : [lookupEmail, req.user.id];
+    const r = await db.query(sql, params);
     res.json(r.rows.map(ticketRow));
   } catch (e) {
     console.error('GET /api/tickets:', e.code, e.message);
