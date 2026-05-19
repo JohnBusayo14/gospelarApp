@@ -464,6 +464,16 @@ router.post('/api/events/:id/register', async (req, res) => {
   const attendees     = Array.isArray(req.body?.attendees) ? req.body.attendees : [];
   const group         = req.body?.group || null;
   const referrer      = req.body?.referrer ? String(req.body.referrer).slice(0, 80) : null;
+  // Optional seat picks — index aligns with attendees[]. Empty string means
+  // "let the system auto-assign". Length must match attendees.length when
+  // provided; we reject malformed payloads up front so the transaction
+  // doesn't open just to roll back.
+  const seatLabels    = Array.isArray(req.body?.seatLabels)
+    ? req.body.seatLabels.map((s) => (s == null ? '' : String(s).trim()))
+    : null;
+  if (seatLabels && seatLabels.length !== attendees.length) {
+    return res.status(400).json({ error: 'seatLabels length must match attendees length.' });
+  }
 
   if (!eventId)      return res.status(400).json({ error: 'Event id is required.' });
   if (!ticketTypeId) return res.status(400).json({ error: 'ticketTypeId is required.' });
@@ -583,7 +593,9 @@ router.post('/api/events/:id/register', async (req, res) => {
 
     const ticketUrlOrigin = String(req.body?.origin || process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
     const tickets = [];
-    for (const a of attendees) {
+    for (let aIdx = 0; aIdx < attendees.length; aIdx++) {
+      const a = attendees[aIdx];
+      const pickedSeat = (seatLabels && seatLabels[aIdx]) ? seatLabels[aIdx] : null;
       let code; let attempts = 0;
       // Vanishingly small odds of collision but loop on the unique violation
       // anyway — six-char codes have ~887M permutations.
@@ -596,10 +608,10 @@ router.post('/api/events/:id/register', async (req, res) => {
                 group_id, group_type, group_name, group_lead_email,
                 attendee_name, attendee_email, attendee_phone, attendee_profile,
                 age_group, dietary, emergency_name, emergency_phone,
-                role, referrer, status, ticket_url,
+                role, referrer, status, ticket_url, seat_label,
                 registered_by_user_id, registered_by_email,
                 custom_answers)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23::jsonb)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb)
              RETURNING *`,
             [
               code, eventId, ticketTypeId, accommodationId,
@@ -634,6 +646,7 @@ router.post('/api/events/:id/register', async (req, res) => {
               referrer,
               'confirmed',
               ticketUrlOrigin ? `${ticketUrlOrigin}/tickets/${code}` : `/tickets/${code}`,
+              pickedSeat || null,
               actor?.id || null,
               actor?.email ? actor.email.toLowerCase() : null,
               // customAnswers is the registrant's responses to event.custom_questions.
